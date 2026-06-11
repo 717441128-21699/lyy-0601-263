@@ -8,36 +8,13 @@ from ..storage import (
     load_db, add_task, get_task, update_task, delete_task,
     list_tasks, get_procrastinated_tasks, get_overdue_tasks,
     add_subtask, toggle_subtask, get_paper, get_project, add_project,
-    get_task_paper, get_task_notes, ensure_project,
+    ensure_project, parse_date,
+    validate_phase_id, validate_milestone_id,
 )
 from ..utils.formatting import (
     print_tasks, print_task_detail, print_success, print_error,
     print_warning, get_status_label,
 )
-
-
-def parse_date(date_str: str) -> Optional[str]:
-    """解析日期字符串，返回 YYYY-MM-DD 格式"""
-    if not date_str:
-        return None
-
-    formats = [
-        "%Y-%m-%d",
-        "%Y/%m/%d",
-        "%m-%d",
-        "%m/%d",
-    ]
-
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(date_str, fmt)
-            if fmt in ["%m-%d", "%m/%d"]:
-                dt = dt.replace(year=datetime.now().year)
-            return dt.strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-
-    return None
 
 
 @click.group()
@@ -87,6 +64,18 @@ def add(title: str, description: str, project: str, priority: str,
     if paper and not get_paper(db, paper):
         print_error(f"未找到 ID 为 {paper} 的文献")
         return
+
+    if phase:
+        ok, msg = validate_phase_id(db, project, phase)
+        if not ok:
+            print_error(msg)
+            return
+
+    if milestone:
+        ok, msg = validate_milestone_id(db, project, milestone)
+        if not ok:
+            print_error(msg)
+            return
 
     tags = list(tag)
     task = Task(
@@ -237,9 +226,20 @@ def update(id: str, title: Optional[str], description: Optional[str],
             print_error(f"日期格式无效: {due}，请使用 YYYY-MM-DD 格式")
             return
         kwargs["due_date"] = due_date
+
+    target_project = kwargs.get("project", task.project)
+
     if phase is not None:
+        ok, msg = validate_phase_id(db, target_project, phase)
+        if not ok:
+            print_error(msg)
+            return
         kwargs["phase_id"] = phase
     if milestone is not None:
+        ok, msg = validate_milestone_id(db, target_project, milestone)
+        if not ok:
+            print_error(msg)
+            return
         kwargs["milestone_id"] = milestone
     if tag:
         new_tags = list(set(task.tags + list(tag)))
@@ -251,6 +251,9 @@ def update(id: str, title: Optional[str], description: Optional[str],
 
     updated = update_task(db, id, **kwargs)
     if updated:
+        warnings = getattr(updated, "_last_warnings", [])
+        for w in warnings:
+            print_warning(w)
         print_success(f"任务更新成功: [{id}]")
 
 

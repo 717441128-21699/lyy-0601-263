@@ -694,7 +694,7 @@ def print_project_review(
     content.append("")
 
     if phases_data:
-        content.append("[bold]📋 阶段概览:[/bold]")
+        content.append("[bold]📋 阶段推进:[/bold]")
         for pd in phases_data:
             phase = pd.get('phase')
             if not phase:
@@ -703,21 +703,40 @@ def print_project_review(
             phase_status_label = get_phase_status_label(phase.status)
             total = pd.get('total', 0)
             done = pd.get('done', 0)
+            doing = pd.get('doing', 0)
+            todo = pd.get('todo', 0)
             blocked = pd.get('blocked', 0)
             blocked_tasks = pd.get('blocked_tasks', [])
+            blocked_reasons = pd.get('blocked_reasons', [])
+            recent_tasks = pd.get('recent_tasks', [])
+            suggestions = pd.get('suggestions', [])
 
             content.append(f"  [{phase.order}] [{phase_status_style}]{phase_status_label}[/] "
-                           f"[bold]{phase.name}[/]")
-            content.append(f"      目标日期: {phase.target_date or '-'} | "
-                           f"任务: {done}/{total} | 阻塞: [red]{blocked}[/]")
+                           f"[bold]{phase.name}[/] [dim](目标: {phase.target_date or '-'})[/]")
+            content.append(f"    进度: 完成{done} | 进行中{doing} | 待办{todo} | 阻塞[red]{blocked}[/] | "
+                           f"[bold]共{total}[/]")
 
-            if blocked_tasks:
-                content.append(f"      [red]阻塞任务:[/]")
-                for bt in blocked_tasks[:3]:
-                    bt_title = bt.title[:30] + "..." if len(bt.title) > 30 else bt.title
-                    content.append(f"        • [{bt.id}] {bt_title}")
-                if len(blocked_tasks) > 3:
-                    content.append(f"        [dim]...还有 {len(blocked_tasks) - 3} 项[/]")
+            if blocked_reasons:
+                content.append(f"    [red]🚧 阻塞原因:[/]")
+                for br in blocked_reasons[:3]:
+                    bt = br["task"]
+                    bt_title = bt.title[:25] + "..." if len(bt.title) > 25 else bt.title
+                    content.append(f"      • [{bt.id}] {bt_title} -> {br['reason']}")
+
+            if recent_tasks:
+                content.append(f"    [cyan]🕐 最近更新:[/]")
+                for rt in recent_tasks[:3]:
+                    rt_title = rt.title[:28] + "..." if len(rt.title) > 28 else rt.title
+                    status_style = get_status_style(rt.status)
+                    status_label = get_status_label(rt.status)
+                    upd = rt.updated_at.split()[0] if rt.updated_at else "-"
+                    content.append(f"      • [{rt.id}] [{status_style}]{status_label}[/] {rt_title} [dim]({upd})[/]")
+
+            if suggestions:
+                content.append(f"    [green]💡 建议下一步:[/]")
+                for sg in suggestions[:2]:
+                    content.append(f"      → {sg}")
+
             content.append("")
 
     if stagnant_exp:
@@ -821,41 +840,54 @@ def print_phase_detail(phase_detail_dict: dict) -> None:
 
 
 def print_weekly_reports_list(reports: List[WeeklyReport], project: Optional[str] = None) -> None:
+    from ..storage import normalize_weekly_metrics
+
     title = "周报历史记录"
     if project:
         title += f" - {project}"
 
     table = Table(title=title, show_lines=False)
     table.add_column("ID", style="dim", width=10)
-    table.add_column("标题", style="bold", no_wrap=False)
-    table.add_column("项目", width=15)
     table.add_column("时间范围", justify="center", width=22)
-    table.add_column("详略级别", justify="center", width=10)
-    table.add_column("创建时间", style="dim", width=20)
+    table.add_column("级别", justify="center", width=6)
+    table.add_column("任务", justify="center", width=10)
+    table.add_column("任务完成率", justify="center", width=10)
+    table.add_column("文献", justify="center", width=8)
+    table.add_column("阅读完成率", justify="center", width=10)
+    table.add_column("创建时间", style="dim", width=16)
 
     detail_labels = {
-        "simple": "简略",
-        "full": "详细",
+        "simple": "简",
+        "full": "详",
     }
 
     for r in reports:
         time_range = f"{r.start_date} ~ {r.end_date}"
         detail_label = detail_labels.get(r.detail_level, r.detail_level)
-        title_text = r.title[:30] + "..." if len(r.title) > 30 else r.title
+        nm = normalize_weekly_metrics(r.metrics or {})
+
+        task_text = f"{nm['completed_tasks']}/{nm['total_tasks']}"
+        task_rate_style = "green" if nm["task_completion_rate"] >= 70 else ("yellow" if nm["task_completion_rate"] >= 40 else "red")
+        paper_text = f"{nm['read_papers']}/{nm['total_papers']}"
+        paper_rate_style = "green" if nm["paper_completion_rate"] >= 70 else ("yellow" if nm["paper_completion_rate"] >= 40 else "red")
 
         table.add_row(
             r.id,
-            title_text,
-            r.project or "-",
             time_range,
             detail_label,
-            r.created_at,
+            task_text,
+            Text(f"{nm['task_completion_rate']:.1f}%", style=task_rate_style),
+            paper_text,
+            Text(f"{nm['paper_completion_rate']:.1f}%", style=paper_rate_style),
+            r.created_at[:16] if len(r.created_at) > 16 else r.created_at,
         )
 
     console.print(table)
 
 
 def print_weekly_report_detail(report: WeeklyReport) -> None:
+    from ..storage import normalize_weekly_metrics
+
     content = []
     content.append(f"[bold]标题:[/bold] {report.title}")
     content.append(f"[bold]项目:[/bold] {report.project or '-'}")
@@ -870,15 +902,14 @@ def print_weekly_report_detail(report: WeeklyReport) -> None:
     content.append(f"[bold]详略级别:[/bold] {detail_label}")
     content.append(f"[bold]格式:[/bold] {format_label}")
 
-    metrics = report.metrics or {}
-    if metrics:
-        content.append("")
-        content.append("[bold]📊 指标摘要:[/bold]")
-        for key, value in metrics.items():
-            if isinstance(value, (int, float)):
-                content.append(f"  {key}: [bold]{value}[/]")
-            else:
-                content.append(f"  {key}: {value}")
+    nm = normalize_weekly_metrics(report.metrics or {})
+    content.append("")
+    content.append("[bold]📊 关键指标:[/bold]")
+    content.append(f"  任务: [bold]{nm['completed_tasks']}/{nm['total_tasks']}[/] "
+                   f"(完成率 [green]{nm['task_completion_rate']:.1f}%[/])")
+    content.append(f"  文献: [bold]{nm['read_papers']}/{nm['total_papers']}[/] "
+                   f"(阅读完成率 [cyan]{nm['paper_completion_rate']:.1f}%[/])")
+    content.append(f"  实验: [bold]{nm['completed_experiments']}/{nm['total_experiments']}[/]")
 
     content.append("")
     content.append(f"[dim]创建时间: {report.created_at}[/]")
@@ -891,3 +922,156 @@ def print_weekly_report_detail(report: WeeklyReport) -> None:
             console.print(Panel(report.content, title="📝 周报内容", expand=False))
         else:
             console.print(Panel(report.content, title="📝 周报内容", expand=False))
+
+
+HEALTH_LEVEL_STYLES = {
+    "excellent": {"label": "🌟 优秀", "color": "green"},
+    "good": {"label": "💪 良好", "color": "cyan"},
+    "warning": {"label": "⚠️  警戒", "color": "yellow"},
+    "critical": {"label": "🚨 危急", "color": "red"},
+}
+
+
+def print_monthly_overview(projects_health: List[Dict]) -> None:
+    """月度复盘：全项目健康概览"""
+    from rich.table import Table
+    from ..storage import normalize_weekly_metrics
+
+    console = Console()
+
+    total = len(projects_health)
+    if total == 0:
+        print_warning("暂无活跃项目")
+        return
+
+    excellent_count = sum(1 for h in projects_health if h["level"] == "excellent")
+    good_count = sum(1 for h in projects_health if h["level"] == "good")
+    warning_count = sum(1 for h in projects_health if h["level"] == "warning")
+    critical_count = sum(1 for h in projects_health if h["level"] == "critical")
+
+    header_content = []
+    header_content.append(f"[bold]共 {total} 个活跃项目[/bold]")
+    header_content.append(f"  [green]优秀: {excellent_count}[/]  [cyan]良好: {good_count}[/]  "
+                          f"[yellow]警戒: {warning_count}[/]  [red]危急: {critical_count}[/]")
+    console.print(Panel("\n".join(header_content), title="📋 月度复盘 - 项目健康概览", expand=False))
+    print()
+
+    table = Table(title="项目健康度排名", show_lines=False, show_header=True, header_style="bold")
+    table.add_column("排名", justify="center", width=5)
+    table.add_column("项目", style="bold")
+    table.add_column("得分", justify="center", width=8)
+    table.add_column("等级", justify="center", width=10)
+    table.add_column("任务", justify="center", width=10)
+    table.add_column("任务完成率", justify="center", width=10)
+    table.add_column("阶段", justify="center", width=8)
+    table.add_column("阻塞", justify="center", width=6)
+    table.add_column("停滞实验", justify="center", width=8)
+    table.add_column("建议", style="dim")
+
+    for idx, h in enumerate(projects_health, start=1):
+        level = h["level"]
+        style_info = HEALTH_LEVEL_STYLES.get(level, {"label": level, "color": "white"})
+        m = h["metrics"]
+
+        tr_style = "green" if m["task_completion_rate"] >= 70 else ("yellow" if m["task_completion_rate"] >= 40 else "red")
+        blocked_style = "red" if m["blocked_count"] > 0 else "white"
+        stagnant_style = "red" if m["stagnant_count"] > 0 else "white"
+
+        table.add_row(
+            str(idx),
+            h["project"].name[:18] + "..." if len(h["project"].name) > 18 else h["project"].name,
+            str(h["score"]),
+            Text(style_info["label"], style=style_info["color"]),
+            f"{m['done_tasks']}/{m['total_tasks']}",
+            Text(f"{m['task_completion_rate']:.1f}%", style=tr_style),
+            f"{m['done_phases']}/{m['total_phases']}",
+            Text(str(m["blocked_count"]), style=blocked_style),
+            Text(str(m["stagnant_count"]), style=stagnant_style),
+            h["suggestion"][:30] + "..." if len(h["suggestion"]) > 30 else h["suggestion"],
+        )
+
+    console.print(table)
+
+
+def print_monthly_project_detail(health: Dict) -> None:
+    """月度复盘：单个项目的详细健康分析"""
+    from rich.table import Table
+    from ..storage import normalize_weekly_metrics
+
+    console = Console()
+    proj = health["project"]
+    level = health["level"]
+    style_info = HEALTH_LEVEL_STYLES.get(level, {"label": level, "color": "white"})
+    m = health["metrics"]
+
+    header_content = []
+    header_content.append(f"[bold]项目:[/bold] {proj.name}")
+    if proj.description:
+        header_content.append(f"[bold]描述:[/bold] {proj.description}")
+    header_content.append(f"[bold]健康等级:[/bold] [{style_info['color']}]{style_info['label']}[/]  "
+                          f"[bold]得分:[/bold] [{style_info['color']}]{health['score']}[/]")
+    header_content.append(f"[bold]建议:[/bold] {health['suggestion']}")
+
+    console.print(Panel("\n".join(header_content), title=f"月度健康分析 - {proj.name}", expand=False))
+    print()
+
+    m_table = Table(title="核心指标", show_lines=False, show_header=True, header_style="bold")
+    m_table.add_column("维度")
+    m_table.add_column("进度", justify="center")
+    m_table.add_column("完成率", justify="center")
+
+    tr_style = "green" if m["task_completion_rate"] >= 70 else ("yellow" if m["task_completion_rate"] >= 40 else "red")
+    pr_style = "green" if m["paper_rate"] >= 70 else ("yellow" if m["paper_rate"] >= 40 else "red")
+    phr_style = "green" if m["phase_rate"] >= 70 else ("yellow" if m["phase_rate"] >= 40 else "red")
+
+    m_table.add_row("任务", f"{m['done_tasks']}/{m['total_tasks']}", Text(f"{m['task_completion_rate']:.1f}%", style=tr_style))
+    m_table.add_row("阶段", f"{m['done_phases']}/{m['total_phases']}", Text(f"{m['phase_rate']:.1f}%", style=phr_style))
+    m_table.add_row("文献", f"{m['read_papers']}/{m['total_papers']}", Text(f"{m['paper_rate']:.1f}%", style=pr_style))
+    m_table.add_row("阻塞", f"{m['blocked_count']}项 ({m['blocked_ratio']:.0f}%)", "-")
+    m_table.add_row("逾期", f"{m['overdue_count']}项 ({m['overdue_ratio']:.0f}%)", "-")
+    m_table.add_row("停滞实验", f"{m['stagnant_count']}项", "-")
+
+    console.print(m_table)
+    print()
+
+    reports = health.get("recent_weekly_reports", [])
+    if reports:
+        r_table = Table(title="最近周报趋势", show_lines=False, show_header=True, header_style="bold")
+        r_table.add_column("时间范围")
+        r_table.add_column("任务", justify="center")
+        r_table.add_column("任务完成率", justify="center")
+        r_table.add_column("文献", justify="center")
+        r_table.add_column("阅读完成率", justify="center")
+
+        for r in reports:
+            nm = normalize_weekly_metrics(r.metrics or {})
+            tr_style = "green" if nm["task_completion_rate"] >= 70 else ("yellow" if nm["task_completion_rate"] >= 40 else "red")
+            pr_style = "green" if nm["paper_completion_rate"] >= 70 else ("yellow" if nm["paper_completion_rate"] >= 40 else "red")
+            time_range = f"{r.start_date}~{r.end_date[5:]}"
+
+            r_table.add_row(
+                time_range,
+                f"{nm['completed_tasks']}/{nm['total_tasks']}",
+                Text(f"{nm['task_completion_rate']:.1f}%", style=tr_style),
+                f"{nm['read_papers']}/{nm['total_papers']}",
+                Text(f"{nm['paper_completion_rate']:.1f}%", style=pr_style),
+            )
+        console.print(r_table)
+        print()
+
+    if health["blocked_tasks"]:
+        print_warning(f"🚧 {len(health['blocked_tasks'])} 项阻塞任务:")
+        for bt in health["blocked_tasks"][:5]:
+            reason = bt.description[:50] + "..." if bt.description and len(bt.description) > 50 else (bt.description or "未注明原因")
+            print_info(f"  • [{bt.id}] {bt.title[:30]} -> {reason}")
+        if len(health["blocked_tasks"]) > 5:
+            print_info(f"  [dim]...还有 {len(health['blocked_tasks']) - 5} 项[/]")
+        print()
+
+    if health["stagnant_experiments"]:
+        print_warning(f"⏸ {len(health['stagnant_experiments'])} 项长期未动实验:")
+        for se in health["stagnant_experiments"][:5]:
+            print_info(f"  • [{se.id}] {se.title[:40]} [dim](更新: {se.updated_at[:10]})[/]")
+        if len(health["stagnant_experiments"]) > 5:
+            print_info(f"  [dim]...还有 {len(health['stagnant_experiments']) - 5} 项[/]")
+        print()

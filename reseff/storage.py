@@ -15,6 +15,34 @@ DEFAULT_DIR = ".reseff"
 DB_FILE = "reseff_data.json"
 
 
+def _priority_sort_key(task: Task):
+    """优先级排序键：high > medium > low"""
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    return priority_order.get(task.priority, 1)
+
+
+def parse_date(date_str: Optional[str]) -> Optional[str]:
+    """解析日期字符串，返回 YYYY-MM-DD 格式"""
+    if not date_str:
+        return None
+
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m-%d",
+        "%m/%d",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            if fmt in ("%m-%d", "%m/%d"):
+                dt = dt.replace(year=datetime.now().year)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
 def get_storage_path() -> Path:
     """获取存储目录路径"""
     home = Path.home()
@@ -318,9 +346,27 @@ def update_task(db: Database, id: str, **kwargs) -> Optional[Task]:
     task = _find_by_id(db.tasks, id)
     if task:
         old_paper_id = task.paper_id
+        old_project = task.project
+        needs_save_warnings = []
+
         for key, value in kwargs.items():
             if hasattr(task, key) and value is not None:
                 setattr(task, key, value)
+
+        new_project = kwargs.get("project", old_project)
+
+        if new_project != old_project and new_project:
+            if task.phase_id:
+                ok, _ = validate_phase_id(db, new_project, task.phase_id)
+                if not ok:
+                    task.phase_id = None
+                    needs_save_warnings.append("阶段归属不一致，已解除阶段关联")
+            if task.milestone_id:
+                ok, _ = validate_milestone_id(db, new_project, task.milestone_id)
+                if not ok:
+                    task.milestone_id = None
+                    needs_save_warnings.append("里程碑归属不一致，已解除里程碑关联")
+
         if "paper_id" in kwargs and kwargs["paper_id"] != old_paper_id:
             if old_paper_id:
                 old_paper = get_paper(db, old_paper_id)
@@ -336,6 +382,7 @@ def update_task(db: Database, id: str, **kwargs) -> Optional[Task]:
         if task.status == "done" and not task.done_at:
             task.done_at = _now_str()
         save_db(db)
+        task._last_warnings = needs_save_warnings
     return task
 
 
@@ -1088,13 +1135,15 @@ def get_long_term_tasks(
 # ==================== 阶段详情增强 ====================
 
 def get_phase_detail(db: Database, project_name: str, phase_id: str) -> Dict:
-    """获取阶段详情（包含任务统计、阻塞任务、最近更新任务）"""
+    """获取阶段详情（包含任务统计、阻塞任务、最近更新任务、建议下一步）"""
     phase = get_phase(db, project_name, phase_id)
     if not phase:
         return {}
 
     tasks = get_phase_tasks(db, project_name, phase_id)
     done_count = len([t for t in tasks if t.is_done])
+    doing_count = len([t for t in tasks if t.status == "doing"])
+    todo_count = len([t for t in tasks if t.status == "todo"])
     blocked_tasks = [t for t in tasks if t.status == "blocked"]
     blocked_count = len(blocked_tasks)
 
@@ -1105,11 +1154,238 @@ def get_phase_detail(db: Database, project_name: str, phase_id: str) -> Dict:
     )
     recent_tasks = sorted_tasks[:5]
 
+    blocked_reasons = []
+    for bt in blocked_tasks:
+        reason = bt.description if bt.description else "未注明原因"
+        if len(reason) > 60:
+            reason = reason[:60] + "..."
+        blocked_reasons.append({"task": bt, "reason": reason})
+
+    suggestions = []
+    if blocked_count > 0:
+        bt = blocked_tasks[0]
+        suggestions.append(f"优先处理阻塞任务: [{bt.id}] {bt.title[:25]}")
+    elif doing_count > 0:
+        doing_sorted = sorted(
+            [t for t in tasks if t.status == "doing"],
+            key=lambda t: _parse_date(t.updated_at) or datetime.min,
+        )
+        dt = doing_sorted[0]
+        suggestions.append(f"推进进行中任务: [{dt.id}] {dt.title[:25]}")
+    elif todo_count > 0 and done_count < len(tasks):
+        todo_sorted = sorted(
+            [t for t in tasks if t.status == "todo"],
+            key=_priority_sort_key,
+        )
+        nt = todo_sorted[0]
+        suggestions.append(f"启动下一个待办: [{nt.id}] {nt.title[:25]}")
+    elif done_count == len(tasks) and len(tasks) > 0:
+        suggestions.append("本阶段任务全部完成，考虑更新阶段状态为 done")
+    else:
+        suggestions.append("本阶段暂无任务，建议添加任务开始推进")
+
     return {
         "phase": phase,
         "tasks": tasks,
+        "total": len(tasks),
         "done_count": done_count,
+        "doing_count": doing_count,
+        "todo_count": todo_count,
         "blocked_count": blocked_count,
         "blocked_tasks": blocked_tasks,
+        "blocked_reasons": blocked_reasons,
         "recent_tasks": recent_tasks,
+        "suggestions": suggestions,
     }
+
+
+# ==================== 阶段/里程碑关联校验 ====================
+
+def validate_phase_id(db: Database, project_name: str, phase_id: Optional[str]) -> Tuple[bool, str]:
+    """校验阶段ID是否合法，返回 (是否通过, 错误信息)"""
+    if not phase_id:
+        return True, ""
+    project = get_project(db, project_name)
+    if not project:
+        return False, f"项目 '{project_name}' 不存在"
+    phase = get_phase(db, project_name, phase_id)
+    if not phase:
+        return False, f"阶段 ID '{phase_id}' 在项目 '{project_name}' 中不存在"
+    return True, ""
+
+
+def validate_milestone_id(db: Database, project_name: str, milestone_id: Optional[str]) -> Tuple[bool, str]:
+    """校验里程碑ID是否合法，返回 (是否通过, 错误信息)"""
+    if not milestone_id:
+        return True, ""
+    project = get_project(db, project_name)
+    if not project:
+        return False, f"项目 '{project_name}' 不存在"
+    milestone = get_milestone(db, project_name, milestone_id)
+    if not milestone:
+        return False, f"里程碑 ID '{milestone_id}' 在项目 '{project_name}' 中不存在"
+    return True, ""
+
+
+# ==================== 周报 metrics 归一化 ====================
+
+def normalize_weekly_metrics(raw_metrics: Optional[dict]) -> Dict:
+    """统一周报 metrics 字段，兼容历史数据
+
+    返回标准字段:
+      total_tasks, completed_tasks, task_completion_rate,
+      total_papers, read_papers, paper_completion_rate,
+      total_experiments, completed_experiments
+    """
+    if not raw_metrics:
+        raw_metrics = {}
+
+    def _g(keys, default=0):
+        for k in keys:
+            if k in raw_metrics and raw_metrics[k] not in (None, ""):
+                return raw_metrics[k]
+        return default
+
+    total_tasks = _g(["total_tasks", "总任务数"])
+    completed_tasks = _g(["completed_tasks", "完成数", "done_tasks"])
+    task_rate = _g(["task_completion_rate", "完成率", "completion_rate", "task_rate"])
+    if isinstance(task_rate, str) and "%" in task_rate:
+        task_rate = float(task_rate.replace("%", ""))
+    if not task_rate and total_tasks:
+        task_rate = (completed_tasks / total_tasks * 100) if completed_tasks else 0.0
+
+    total_papers = _g(["total_papers", "总文献数", "papers"])
+    read_papers = _g(["read_papers", "已读文献", "read"])
+    paper_rate = _g(["paper_completion_rate", "paper_rate", "阅读完成率"])
+    if isinstance(paper_rate, str) and "%" in paper_rate:
+        paper_rate = float(paper_rate.replace("%", ""))
+    if not paper_rate and total_papers:
+        paper_rate = (read_papers / total_papers * 100) if read_papers else 0.0
+
+    total_experiments = _g(["total_experiments", "实验总数", "experiments"])
+    completed_experiments = _g(["completed_experiments", "完成实验", "exp_done"])
+
+    return {
+        "total_tasks": int(total_tasks) if total_tasks != "-" else 0,
+        "completed_tasks": int(completed_tasks) if completed_tasks != "-" else 0,
+        "task_completion_rate": round(float(task_rate or 0.0), 1),
+        "total_papers": int(total_papers) if total_papers != "-" else 0,
+        "read_papers": int(read_papers) if read_papers != "-" else 0,
+        "paper_completion_rate": round(float(paper_rate or 0.0), 1),
+        "total_experiments": int(total_experiments) if total_experiments != "-" else 0,
+        "completed_experiments": int(completed_experiments) if completed_experiments != "-" else 0,
+    }
+
+
+# ==================== 项目健康度与月度复盘 ====================
+
+def calc_project_health(db: Database, project_name: str) -> Dict:
+    """计算单个项目的健康度，返回得分、等级和各项指标
+
+    分数范围: 0~100
+    等级: excellent(>=80), good(>=60), warning(>=40), critical(<40)
+    """
+    proj = get_project(db, project_name)
+    if not proj:
+        return {}
+
+    progress = get_project_progress(db, project_name)
+    tasks = list_tasks(db, project=project_name)
+    papers = list_papers(db, project=project_name)
+    stagnant = get_stagnant_experiments(db, project=project_name)
+
+    total_tasks = len(tasks)
+    total_phases = len(proj.phases)
+    done_tasks = progress.get("done_tasks", 0)
+    blocked_tasks = [t for t in tasks if t.status == "blocked"]
+    overdue_tasks = [t for t in tasks if t.is_overdue]
+
+    task_completion_rate = progress.get("task_completion", 0.0)
+    paper_rate = progress.get("paper_progress", 0.0)
+    phase_rate = (progress.get("done_phases", 0) / total_phases * 100) if total_phases > 0 else 0.0
+
+    blocked_ratio = (len(blocked_tasks) / total_tasks * 100) if total_tasks > 0 else 0.0
+    overdue_ratio = (len(overdue_tasks) / total_tasks * 100) if total_tasks > 0 else 0.0
+    stagnant_count = len(stagnant)
+
+    score = 0.0
+    score += task_completion_rate * 0.4
+    score += paper_rate * 0.2
+    score += phase_rate * 0.2
+    score -= blocked_ratio * 0.5
+    score -= overdue_ratio * 0.3
+    score -= stagnant_count * 5
+    score = max(0.0, min(100.0, score))
+
+    if score >= 80:
+        level = "excellent"
+    elif score >= 60:
+        level = "good"
+    elif score >= 40:
+        level = "warning"
+    else:
+        level = "critical"
+
+    if level == "excellent":
+        suggestion = "进展优秀，按当前节奏推进即可"
+    elif level == "good":
+        suggestion = "整体良好，关注阻塞项和逾期任务"
+    elif level == "warning":
+        if blocked_ratio > 30:
+            suggestion = "阻塞比例高，建议优先排除阻碍"
+        elif stagnant_count >= 2:
+            suggestion = "多项实验停滞，建议评估实验优先级或暂停"
+        else:
+            suggestion = "需要重点关注，建议加快进度"
+    else:
+        if total_tasks > 0 and task_completion_rate < 20 and stagnant_count > 0:
+            suggestion = "长期无显著进展，建议评估是否暂停或归档"
+        elif blocked_ratio > 50:
+            suggestion = "严重阻塞，需要资源支持或重新规划"
+        else:
+            suggestion = "状态危急，需要立即介入调整"
+
+    recent_reports = [
+        r for r in (list_weekly_reports(db, project=project_name) or [])
+    ][-4:]
+
+    return {
+        "project": proj,
+        "score": round(score, 1),
+        "level": level,
+        "suggestion": suggestion,
+        "metrics": {
+            "total_tasks": total_tasks,
+            "done_tasks": done_tasks,
+            "task_completion_rate": round(task_completion_rate, 1),
+            "blocked_count": len(blocked_tasks),
+            "blocked_ratio": round(blocked_ratio, 1),
+            "overdue_count": len(overdue_tasks),
+            "overdue_ratio": round(overdue_ratio, 1),
+            "total_papers": len(papers),
+            "read_papers": progress.get("read_papers", 0),
+            "paper_rate": round(paper_rate, 1),
+            "total_phases": total_phases,
+            "done_phases": progress.get("done_phases", 0),
+            "phase_rate": round(phase_rate, 1),
+            "stagnant_count": stagnant_count,
+        },
+        "blocked_tasks": blocked_tasks,
+        "overdue_tasks": overdue_tasks,
+        "stagnant_experiments": stagnant,
+        "recent_weekly_reports": recent_reports,
+    }
+
+
+def get_all_projects_health(db: Database) -> List[Dict]:
+    """获取所有非归档项目的健康度列表"""
+    projects = list_projects(db)
+    results = []
+    for p in projects:
+        if p.archived:
+            continue
+        health = calc_project_health(db, p.name)
+        if health:
+            results.append(health)
+    results.sort(key=lambda h: h["score"], reverse=True)
+    return results

@@ -10,7 +10,7 @@ from ..storage import (
     add_phase, get_phase, update_phase, delete_phase,
     add_milestone, get_milestone, update_milestone, delete_milestone,
     get_phase_tasks, get_blocked_tasks_in_phase, get_project_progress,
-    get_current_phase, ensure_project,
+    get_current_phase, ensure_project, parse_date,
     get_phase_detail, get_stagnant_experiments, get_long_term_tasks,
     get_phase_task_count,
 )
@@ -20,30 +20,6 @@ from ..utils.formatting import (
     print_phases, print_milestones, print_project_detail,
     print_project_review, print_phase_detail,
 )
-
-
-def parse_date(date_str: str) -> Optional[str]:
-    """解析日期字符串，返回 YYYY-MM-DD 格式"""
-    if not date_str:
-        return None
-
-    formats = [
-        "%Y-%m-%d",
-        "%Y/%m/%d",
-        "%m-%d",
-        "%m/%d",
-    ]
-
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(date_str, fmt)
-            if fmt in ["%m-%d", "%m/%d"]:
-                dt = dt.replace(year=datetime.now().year)
-            return dt.strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-
-    return None
 
 
 @click.group()
@@ -134,10 +110,15 @@ def project(project_name: Optional[str], tasks: bool, papers: bool):
         if phase_detail:
             phases_data.append({
                 "phase": phase_detail["phase"],
-                "total": len(phase_detail["tasks"]),
+                "total": phase_detail["total"],
                 "done": phase_detail["done_count"],
+                "doing": phase_detail["doing_count"],
+                "todo": phase_detail["todo_count"],
                 "blocked": phase_detail["blocked_count"],
                 "blocked_tasks": phase_detail["blocked_tasks"],
+                "blocked_reasons": phase_detail["blocked_reasons"],
+                "recent_tasks": phase_detail["recent_tasks"],
+                "suggestions": phase_detail["suggestions"],
             })
 
     stagnant_exp = get_stagnant_experiments(db, project=project_name)

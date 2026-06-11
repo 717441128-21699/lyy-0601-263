@@ -7,12 +7,15 @@ from ..storage import (
     load_db, get_completion_rate, get_this_week_completion,
     get_this_week_tasks, list_papers,
     list_weekly_reports, get_weekly_report,
+    normalize_weekly_metrics,
+    get_all_projects_health, calc_project_health,
 )
 from ..utils.formatting import (
     print_completion_stats, print_week_review, print_papers,
     print_success, print_error, print_warning, print_info,
     get_status_label,
     print_weekly_reports_list, print_weekly_report_detail,
+    print_monthly_overview, print_monthly_project_detail,
 )
 
 
@@ -230,10 +233,11 @@ def summary():
         print()
         print_info(f"📄 最近周报: {latest.title} ({latest.start_date} ~ {latest.end_date})")
         if latest.metrics:
-            metrics = latest.metrics
-            metric_items = list(metrics.items())[:3]
-            for key, value in metric_items:
-                print_info(f"   {key}: {value}")
+            nm = normalize_weekly_metrics(latest.metrics)
+            print_info(f"   任务 {nm['completed_tasks']}/{nm['total_tasks']} "
+                       f"(完成率 {nm['task_completion_rate']:.1f}%) | "
+                       f"文献 {nm['read_papers']}/{nm['total_papers']} "
+                       f"(阅读完成率 {nm['paper_completion_rate']:.1f}%)")
 
 
 @review.command()
@@ -291,34 +295,72 @@ def trend(project: Optional[str]):
 
     from rich.table import Table
     from rich.console import Console
+    from rich.text import Text
 
     console = Console()
 
     table = Table(title=f"📈 指标变化趋势（最近 {len(recent_reports)} 份周报）", show_header=True, header_style="bold")
-    table.add_column("周报", style="bold", width=20)
-    table.add_column("总任务数", justify="right")
-    table.add_column("完成数", justify="right")
-    table.add_column("完成率", justify="right")
-    table.add_column("文献数", justify="right")
-    table.add_column("已读文献", justify="right")
+    table.add_column("时间范围", style="bold", width=22)
+    table.add_column("任务完成", justify="center")
+    table.add_column("任务完成率", justify="center")
+    table.add_column("文献阅读", justify="center")
+    table.add_column("阅读完成率", justify="center")
+    table.add_column("实验", justify="center")
 
     for report in recent_reports:
-        metrics = report.metrics or {}
-        total_tasks = metrics.get("总任务数", metrics.get("total_tasks", "-"))
-        done_tasks = metrics.get("完成数", metrics.get("done_tasks", "-"))
-        completion_rate = metrics.get("完成率", metrics.get("completion_rate", "-"))
-        if isinstance(completion_rate, float):
-            completion_rate = f"{completion_rate:.1f}%"
-        total_papers = metrics.get("总文献数", metrics.get("total_papers", "-"))
-        read_papers = metrics.get("已读文献", metrics.get("read_papers", "-"))
+        nm = normalize_weekly_metrics(report.metrics or {})
 
+        task_text = f"{nm['completed_tasks']}/{nm['total_tasks']}"
+        task_rate = nm['task_completion_rate']
+        tr_style = "green" if task_rate >= 70 else ("yellow" if task_rate >= 40 else "red")
+
+        paper_text = f"{nm['read_papers']}/{nm['total_papers']}"
+        paper_rate = nm['paper_completion_rate']
+        pr_style = "green" if paper_rate >= 70 else ("yellow" if paper_rate >= 40 else "red")
+
+        exp_text = f"{nm['completed_experiments']}/{nm['total_experiments']}"
+
+        time_range = f"{report.start_date}~{report.end_date[5:]}"
         table.add_row(
-            f"{report.title[:18]}",
-            str(total_tasks),
-            str(done_tasks),
-            str(completion_rate),
-            str(total_papers),
-            str(read_papers),
+            time_range,
+            task_text,
+            Text(f"{task_rate:.1f}%", style=tr_style),
+            paper_text,
+            Text(f"{paper_rate:.1f}%", style=pr_style),
+            exp_text,
         )
 
     console.print(table)
+
+
+@review.command()
+@click.option("--project", "-p", default=None, help="按项目查看详细健康分析，不指定则显示全项目概览")
+def monthly(project: Optional[str]):
+    """月度复盘 - 项目健康概览
+
+    综合最近几周周报、阶段推进、阻塞情况和停滞实验，
+    计算健康度得分，并给出推进/暂停/归档建议。
+    """
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    if project:
+        health = calc_project_health(db, project)
+        if not health:
+            print_error(f"未找到项目: {project}")
+            return
+        print_monthly_project_detail(health)
+    else:
+        all_health = get_all_projects_health(db)
+        if not all_health:
+            print_warning("暂无活跃项目")
+            return
+        print_monthly_overview(all_health)
+
+        if len(all_health) <= 3:
+            for h in all_health:
+                print()
+                print_monthly_project_detail(h)
