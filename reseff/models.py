@@ -196,6 +196,24 @@ class Task:
 
 
 @dataclass
+class WeeklyReport:
+    """周报历史记录模型"""
+    id: str = field(default_factory=_new_id)
+    title: str = ""
+    project: str = ""
+    start_date: str = ""
+    end_date: str = ""
+    format: str = "markdown"  # markdown, text, json
+    detail_level: str = "full"  # simple, full
+    content: str = ""
+    metrics: dict = field(default_factory=dict)
+    created_at: str = field(default_factory=_now_str)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class Project:
     """项目模型"""
     id: str = field(default_factory=_new_id)
@@ -227,6 +245,7 @@ class Database:
     notes: List[Note] = field(default_factory=list)
     tasks: List[Task] = field(default_factory=list)
     projects: List[Project] = field(default_factory=list)
+    weekly_reports: List[WeeklyReport] = field(default_factory=list)
     initialized_at: str = field(default_factory=_now_str)
     last_updated: str = field(default_factory=_now_str)
 
@@ -236,6 +255,7 @@ class Database:
             "notes": [n.to_dict() for n in self.notes],
             "tasks": [t.to_dict() for t in self.tasks],
             "projects": [p.to_dict() for p in self.projects],
+            "weekly_reports": [r.to_dict() for r in self.weekly_reports],
             "initialized_at": self.initialized_at,
             "last_updated": self.last_updated,
         }

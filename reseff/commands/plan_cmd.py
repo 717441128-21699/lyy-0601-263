@@ -11,11 +11,14 @@ from ..storage import (
     add_milestone, get_milestone, update_milestone, delete_milestone,
     get_phase_tasks, get_blocked_tasks_in_phase, get_project_progress,
     get_current_phase, ensure_project,
+    get_phase_detail, get_stagnant_experiments, get_long_term_tasks,
+    get_phase_task_count,
 )
 from ..utils.formatting import (
     print_tasks, print_papers, print_projects,
     print_success, print_error, print_warning, print_info,
     print_phases, print_milestones, print_project_detail,
+    print_project_review, print_phase_detail,
 )
 
 
@@ -124,7 +127,23 @@ def project(project_name: Optional[str], tasks: bool, papers: bool):
         return
 
     progress = get_project_progress(db, project_name)
-    print_project_detail(project, progress)
+
+    phases_data = []
+    for phase in project.phases:
+        phase_detail = get_phase_detail(db, project_name, phase.id)
+        if phase_detail:
+            phases_data.append({
+                "phase": phase_detail["phase"],
+                "total": len(phase_detail["tasks"]),
+                "done": phase_detail["done_count"],
+                "blocked": phase_detail["blocked_count"],
+                "blocked_tasks": phase_detail["blocked_tasks"],
+            })
+
+    stagnant_exp = get_stagnant_experiments(db, project=project_name)
+    long_term_tasks = get_long_term_tasks(db, project=project_name)
+
+    print_project_review(project, progress, phases_data, stagnant_exp, long_term_tasks)
 
     show_all = not tasks and not papers
 
@@ -274,7 +293,11 @@ def phase_list(project: str):
         print_warning(f"项目 '{project}' 暂无阶段")
         return
 
-    print_phases(proj.phases, project)
+    phases_stats = {}
+    for ph in proj.phases:
+        phases_stats[ph.id] = get_phase_task_count(db, project, ph.id)
+
+    print_phases(proj.phases, project, phases_stats=phases_stats)
 
 
 @phase.command(name="show")
@@ -293,29 +316,8 @@ def phase_show(project: str, phase_id: str):
         print_error(f"未找到阶段 ID: {phase_id}")
         return
 
-    content = []
-    content.append(f"[bold]阶段名称:[/bold] {phase.name}")
-    content.append(f"[bold]描述:[/bold] {phase.description or '-'}")
-    content.append(f"[bold]顺序:[/bold] {phase.order}")
-    from ..utils.formatting import get_phase_status_label, get_phase_status_style
-    status_style = get_phase_status_style(phase.status)
-    status_label = get_phase_status_label(phase.status)
-    content.append(f"[bold]状态:[/bold] [{status_style}]{status_label}[/]")
-    content.append(f"[bold]目标日期:[/bold] {phase.target_date or '-'}")
-    content.append(f"[bold]完成日期:[/bold] {phase.done_at or '-'}")
-    content.append("")
-    content.append(f"[dim]创建: {phase.created_at} | 更新: {phase.updated_at}[/]")
-
-    from rich.panel import Panel
-    from rich.console import Console
-    console = Console()
-    console.print(Panel("\n".join(content), title=f"阶段详情 [{phase.id}]", expand=False))
-
-    phase_tasks = get_phase_tasks(db, project, phase_id)
-    if phase_tasks:
-        print_tasks(phase_tasks, title=f"阶段关联任务 ({len(phase_tasks)})")
-    else:
-        print_warning("该阶段暂无关联任务")
+    phase_detail = get_phase_detail(db, project, phase_id)
+    print_phase_detail(phase_detail)
 
 
 @phase.command(name="update")

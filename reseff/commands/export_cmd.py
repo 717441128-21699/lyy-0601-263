@@ -7,14 +7,17 @@ from pathlib import Path
 
 from ..storage import (
     load_db, archive_project, list_projects,
-    get_tasks_in_range, get_papers_in_range, get_experiment_progress_in_range,
+    get_tasks_in_range, get_papers_in_range_dedup, get_experiment_progress_in_range,
     get_reminder_tasks, get_project_progress, ensure_project,
-    get_completion_rate,
+    get_completion_rate, add_weekly_report, get_weekly_report,
+    list_weekly_reports, delete_weekly_report, get_long_term_tasks,
+    get_coming_soon_tasks, get_long_pending_tasks,
 )
-from ..models import Task, Paper
+from ..models import Task, Paper, WeeklyReport
 from ..utils.formatting import (
     print_success, print_error, print_warning, print_info,
     get_status_label, get_priority_label, print_reminder_tasks,
+    print_weekly_reports_list, print_weekly_report_detail,
 )
 
 
@@ -44,43 +47,131 @@ def _parse_date_str(date_str: str) -> Optional[str]:
         return None
 
 
-def _get_next_week_plan_tasks(db, project):
-    """获取下周计划任务（即将到期的任务）"""
-    now = datetime.now()
-    next_week_start = (now + timedelta(days=(7 - now.weekday()))).date()
-    next_week_end = next_week_start + timedelta(days=6)
+def _priority_sort_key(task):
+    """优先级排序键：high > medium > low"""
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    return priority_order.get(task.priority, 1)
 
+
+def _get_next_week_plan_tasks(db, project):
+    """获取下周计划任务（从即将到期和远期任务中提取，按优先级排序）"""
+    coming_soon = get_coming_soon_tasks(db, project=project)
+    long_term = get_long_term_tasks(db, project=project)
+
+    seen_ids = set()
     plan_tasks = []
-    for t in db.tasks:
-        if project and t.project != project:
-            continue
-        if t.is_done:
-            continue
-        if t.due_date:
-            try:
-                due = datetime.strptime(t.due_date, "%Y-%m-%d").date()
-                if next_week_start <= due <= next_week_end:
-                    plan_tasks.append(t)
-            except ValueError:
-                continue
+
+    for t in coming_soon:
+        if t.id not in seen_ids:
+            seen_ids.add(t.id)
+            plan_tasks.append(t)
+
+    for t in long_term:
+        if t.id not in seen_ids:
+            seen_ids.add(t.id)
+            plan_tasks.append(t)
+
+    plan_tasks.sort(key=_priority_sort_key)
     return plan_tasks
+
+
+def _calc_weekly_stats(task_data, paper_data, exp_progress):
+    """统一计算周报统计数据，确保所有格式输出一致
+
+    任务总数 = 周末未完成任务 + 本周完成任务（去重后，本周涉及的所有任务）
+    阅读进度 = 去重后的文献统计
+    """
+    active_count = len(task_data["all_active"])
+    completed_count = len(task_data["completed"])
+    overdue_count = len(task_data["overdue_in_range"])
+    created_count = len(task_data["created"])
+    total_tasks = active_count + completed_count
+
+    task_completion_rate = (completed_count / total_tasks * 100) if total_tasks > 0 else 0
+
+    total_papers = paper_data.get("total_unique", 0)
+    read_papers = paper_data.get("read_unique", 0)
+    paper_rate = (read_papers / total_papers * 100) if total_papers > 0 else 0
+
+    total_experiments = exp_progress.get("total_experiments", 0)
+    completed_experiments = exp_progress.get("completed_experiments", 0)
+    active_experiments = exp_progress.get("active_experiments", 0)
+
+    return {
+        "tasks": {
+            "total": total_tasks,
+            "created": created_count,
+            "completed": completed_count,
+            "overdue": overdue_count,
+            "active": active_count,
+            "completion_rate": task_completion_rate,
+        },
+        "papers": {
+            "total": total_papers,
+            "read": read_papers,
+            "completion_rate": paper_rate,
+        },
+        "experiments": {
+            "total": total_experiments,
+            "completed": completed_experiments,
+            "active": active_experiments,
+        },
+    }
 
 
 def _generate_markdown_weekly(
     title, start, end, project,
     task_data, paper_data, exp_progress,
-    with_next_week_plan, next_week_tasks
+    with_next_week_plan, next_week_tasks,
+    detail_level="full"
 ):
     lines = [f"# {title}", ""]
 
+    stats = _calc_weekly_stats(task_data, paper_data, exp_progress)
+    t_stats = stats["tasks"]
+    p_stats = stats["papers"]
+    e_stats = stats["experiments"]
+
     lines.append("## 📊 概览")
     lines.append("")
-    lines.append(f"- 新增任务: **{len(task_data['created'])}** 项")
-    lines.append(f"- 完成任务: **{len(task_data['completed'])}** 项")
-    lines.append(f"- 逾期任务: **{len(task_data['overdue_in_range'])}** 项")
-    lines.append(f"- 实验总数: **{exp_progress['total_experiments']}** 项")
-    lines.append(f"- 完成实验: **{exp_progress['completed_experiments']}** 项")
+    lines.append(f"- 总任务数: **{t_stats['total']}** 项")
+    lines.append(f"- 完成任务: **{t_stats['completed']}** 项")
+    lines.append(f"- 逾期任务: **{t_stats['overdue']}** 项")
+    lines.append(f"- 进行中: **{t_stats['active']}** 项")
+    lines.append(f"- 任务完成率: **{t_stats['completion_rate']:.1f}%**")
+    lines.append(f"- 实验总数: **{e_stats['total']}** 项")
+    lines.append(f"- 完成实验: **{e_stats['completed']}** 项")
+    lines.append(f"- 文献总数: **{p_stats['total']}**")
+    lines.append(f"- 已读文献: **{p_stats['read']}**")
+    lines.append(f"- 阅读完成率: **{p_stats['completion_rate']:.1f}%**")
     lines.append("")
+
+    if detail_level == "simple":
+        if task_data["completed"]:
+            lines.append("## ✅ 完成项")
+            lines.append("")
+            for t in task_data["completed"]:
+                done_at = t.done_at.split()[0] if t.done_at else ""
+                lines.append(f"- [{get_priority_label(t.priority)}] **{t.title}** ({done_at})")
+            lines.append("")
+
+        if with_next_week_plan:
+            lines.append("## 📅 下周计划")
+            lines.append("")
+            if next_week_tasks:
+                lines.append("根据优先级自动生成：")
+                lines.append("")
+                for t in next_week_tasks:
+                    due = t.due_date or ""
+                    lines.append(f"- [{get_priority_label(t.priority)}] **{t.title}** (截止: {due})")
+            else:
+                lines.append("暂无计划任务，请自定义下周计划。")
+            lines.append("")
+
+        lines.append("---")
+        lines.append(f"*生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+
+        return "\n".join(lines)
 
     if task_data["completed"]:
         lines.append("## ✅ 完成项")
@@ -104,25 +195,22 @@ def _generate_markdown_weekly(
 
     lines.append("## 📚 阅读进度")
     lines.append("")
-    all_papers = paper_data["created"] + paper_data["read"]
-    total = len(all_papers)
-    read_count = len(paper_data["read"])
-    rate = (read_count / total * 100) if total > 0 else 0
-    lines.append(f"- 文献总数: **{total}**")
-    lines.append(f"- 已读: **{read_count}**")
-    lines.append(f"- 完成率: **{rate:.1f}%**")
+    lines.append(f"- 文献总数: **{p_stats['total']}**")
+    lines.append(f"- 已读: **{p_stats['read']}**")
+    lines.append(f"- 完成率: **{p_stats['completion_rate']:.1f}%**")
     lines.append("")
-    if all_papers:
-        for p in all_papers:
-            status = get_status_label(p.status)
-            lines.append(f"- [{status}] **{p.title}** - {p.authors} ({p.year or 'N/A'})")
+    all_papers_list = paper_data.get("all_papers", [])
+    if all_papers_list:
+        for paper in all_papers_list:
+            status = get_status_label(paper.status)
+            lines.append(f"- [{status}] **{paper.title}** - {paper.authors} ({paper.year or 'N/A'})")
         lines.append("")
 
     lines.append("## 🧪 实验进展")
     lines.append("")
-    lines.append(f"- 实验总数: **{exp_progress['total_experiments']}** 项")
-    lines.append(f"- 已完成: **{exp_progress['completed_experiments']}** 项")
-    lines.append(f"- 进行中: **{exp_progress['active_experiments']}** 项")
+    lines.append(f"- 实验总数: **{e_stats['total']}** 项")
+    lines.append(f"- 已完成: **{e_stats['completed']}** 项")
+    lines.append(f"- 进行中: **{e_stats['active']}** 项")
     lines.append("")
     all_exp = exp_progress["completed_tasks"] + exp_progress["active_tasks"]
     if all_exp:
@@ -145,13 +233,13 @@ def _generate_markdown_weekly(
         lines.append("## 📅 下周计划")
         lines.append("")
         if next_week_tasks:
-            lines.append("根据即将到期任务自动生成：")
+            lines.append("根据即将到期和远期任务按优先级自动生成：")
             lines.append("")
             for t in next_week_tasks:
                 due = t.due_date or ""
                 lines.append(f"- [{get_priority_label(t.priority)}] **{t.title}** (截止: {due})")
         else:
-            lines.append("暂无即将到期的任务，请自定义下周计划。")
+            lines.append("暂无计划任务，请自定义下周计划。")
         lines.append("")
 
     lines.append("---")
@@ -163,17 +251,52 @@ def _generate_markdown_weekly(
 def _generate_text_weekly(
     title, start, end, project,
     task_data, paper_data, exp_progress,
-    with_next_week_plan, next_week_tasks
+    with_next_week_plan, next_week_tasks,
+    detail_level="full"
 ):
     lines = [f"{'='*60}", f"{title:^60}", f"{'='*60}", ""]
 
+    stats = _calc_weekly_stats(task_data, paper_data, exp_progress)
+    t_stats = stats["tasks"]
+    p_stats = stats["papers"]
+    e_stats = stats["experiments"]
+
     lines.append("【概览】")
-    lines.append(f"  新增任务: {len(task_data['created'])} 项")
-    lines.append(f"  完成任务: {len(task_data['completed'])} 项")
-    lines.append(f"  逾期任务: {len(task_data['overdue_in_range'])} 项")
-    lines.append(f"  实验总数: {exp_progress['total_experiments']} 项")
-    lines.append(f"  完成实验: {exp_progress['completed_experiments']} 项")
+    lines.append(f"  总任务数: {t_stats['total']} 项")
+    lines.append(f"  完成任务: {t_stats['completed']} 项")
+    lines.append(f"  逾期任务: {t_stats['overdue']} 项")
+    lines.append(f"  进行中: {t_stats['active']} 项")
+    lines.append(f"  任务完成率: {t_stats['completion_rate']:.1f}%")
+    lines.append(f"  实验总数: {e_stats['total']} 项")
+    lines.append(f"  完成实验: {e_stats['completed']} 项")
+    lines.append(f"  文献总数: {p_stats['total']}")
+    lines.append(f"  已读文献: {p_stats['read']}")
+    lines.append(f"  阅读完成率: {p_stats['completion_rate']:.1f}%")
     lines.append("")
+
+    if detail_level == "simple":
+        if task_data["completed"]:
+            lines.append("【完成项】")
+            for t in task_data["completed"]:
+                done_at = t.done_at.split()[0] if t.done_at else ""
+                lines.append(f"  ✓ [{get_priority_label(t.priority)}] {t.title} ({done_at})")
+            lines.append("")
+
+        if with_next_week_plan:
+            lines.append("【下周计划】")
+            if next_week_tasks:
+                lines.append("  根据优先级自动生成：")
+                for t in next_week_tasks:
+                    due = t.due_date or ""
+                    lines.append(f"  - [{get_priority_label(t.priority)}] {t.title} (截止: {due})")
+            else:
+                lines.append("  暂无计划任务，请自定义下周计划。")
+            lines.append("")
+
+        lines.append("-" * 60)
+        lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        return "\n".join(lines)
 
     if task_data["completed"]:
         lines.append("【完成项】")
@@ -190,17 +313,14 @@ def _generate_text_weekly(
         lines.append("")
 
     lines.append("【阅读进度】")
-    all_papers = paper_data["created"] + paper_data["read"]
-    total = len(all_papers)
-    read_count = len(paper_data["read"])
-    rate = (read_count / total * 100) if total > 0 else 0
-    lines.append(f"  文献总数: {total}")
-    lines.append(f"  已读: {read_count}")
-    lines.append(f"  完成率: {rate:.1f}%")
-    if all_papers:
-        for p in all_papers:
-            status = get_status_label(p.status)
-            lines.append(f"  [{status}] {p.title} - {p.authors}")
+    lines.append(f"  文献总数: {p_stats['total']}")
+    lines.append(f"  已读: {p_stats['read']}")
+    lines.append(f"  完成率: {p_stats['completion_rate']:.1f}%")
+    all_papers_list = paper_data.get("all_papers", [])
+    if all_papers_list:
+        for paper in all_papers_list:
+            status = get_status_label(paper.status)
+            lines.append(f"  [{status}] {paper.title} - {paper.authors}")
     lines.append("")
 
     lines.append("【实验进展】")
@@ -225,12 +345,12 @@ def _generate_text_weekly(
     if with_next_week_plan:
         lines.append("【下周计划】")
         if next_week_tasks:
-            lines.append("  根据即将到期任务自动生成：")
+            lines.append("  根据即将到期和远期任务按优先级自动生成：")
             for t in next_week_tasks:
                 due = t.due_date or ""
                 lines.append(f"  - [{get_priority_label(t.priority)}] {t.title} (截止: {due})")
         else:
-            lines.append("  暂无即将到期的任务，请自定义下周计划。")
+            lines.append("  暂无计划任务，请自定义下周计划。")
         lines.append("")
 
     lines.append("-" * 60)
@@ -242,26 +362,36 @@ def _generate_text_weekly(
 def _generate_json_weekly(
     start, end, project,
     task_data, paper_data, exp_progress,
-    with_next_week_plan, next_week_tasks
+    with_next_week_plan, next_week_tasks,
+    detail_level="full"
 ):
-    all_papers = paper_data["created"] + paper_data["read"]
-    total_papers = len(all_papers)
-    read_count = len(paper_data["read"])
-    paper_rate = (read_count / total_papers * 100) if total_papers > 0 else 0
+    stats = _calc_weekly_stats(task_data, paper_data, exp_progress)
+    t_stats = stats["tasks"]
+    p_stats = stats["papers"]
+    e_stats = stats["experiments"]
+    all_papers_list = paper_data.get("all_papers", [])
 
     data = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "detail_level": detail_level,
         "period": {
             "start": start,
             "end": end,
         },
         "project": project or "全部",
         "overview": {
-            "created_tasks": len(task_data["created"]),
-            "completed_tasks": len(task_data["completed"]),
-            "overdue_tasks": len(task_data["overdue_in_range"]),
-            "total_experiments": exp_progress["total_experiments"],
-            "completed_experiments": exp_progress["completed_experiments"],
+            "total_tasks": t_stats["total"],
+            "created_tasks": t_stats["created"],
+            "completed_tasks": t_stats["completed"],
+            "overdue_tasks": t_stats["overdue"],
+            "active_tasks": t_stats["active"],
+            "task_completion_rate": round(t_stats["completion_rate"], 1),
+            "total_experiments": e_stats["total"],
+            "completed_experiments": e_stats["completed"],
+            "active_experiments": e_stats["active"],
+            "total_papers": p_stats["total"],
+            "read_papers": p_stats["read"],
+            "paper_completion_rate": round(p_stats["completion_rate"], 1),
         },
         "completed_tasks": [
             {
@@ -274,7 +404,10 @@ def _generate_json_weekly(
             }
             for t in task_data["completed"]
         ],
-        "overdue_tasks": [
+    }
+
+    if detail_level == "full":
+        data["overdue_tasks"] = [
             {
                 "id": t.id,
                 "title": t.title,
@@ -284,27 +417,27 @@ def _generate_json_weekly(
                 "project": t.project,
             }
             for t in task_data["overdue_in_range"]
-        ],
-        "papers": {
-            "total": total_papers,
-            "read": read_count,
-            "completion_rate": paper_rate,
+        ]
+        data["papers"] = {
+            "total": p_stats["total"],
+            "read": p_stats["read"],
+            "completion_rate": round(p_stats["completion_rate"], 1),
             "items": [
                 {
-                    "id": p.id,
-                    "title": p.title,
-                    "authors": p.authors,
-                    "year": p.year,
-                    "status": p.status,
-                    "project": p.project,
+                    "id": paper_item.id,
+                    "title": paper_item.title,
+                    "authors": paper_item.authors,
+                    "year": paper_item.year,
+                    "status": paper_item.status,
+                    "project": paper_item.project,
                 }
-                for p in all_papers
+                for paper_item in all_papers_list
             ],
-        },
-        "experiments": {
-            "total": exp_progress["total_experiments"],
-            "completed": exp_progress["completed_experiments"],
-            "active": exp_progress["active_experiments"],
+        }
+        data["experiments"] = {
+            "total": e_stats["total"],
+            "completed": e_stats["completed"],
+            "active": e_stats["active"],
             "items": [
                 {
                     "id": t.id,
@@ -315,8 +448,8 @@ def _generate_json_weekly(
                 }
                 for t in (exp_progress["completed_tasks"] + exp_progress["active_tasks"])
             ],
-        },
-        "active_tasks": [
+        }
+        data["active_tasks"] = [
             {
                 "id": t.id,
                 "title": t.title,
@@ -326,8 +459,7 @@ def _generate_json_weekly(
                 "project": t.project,
             }
             for t in task_data["all_active"]
-        ],
-    }
+        ]
 
     if with_next_week_plan:
         data["next_week_plan"] = [
@@ -354,7 +486,12 @@ def _generate_json_weekly(
               help="输出格式（默认markdown）")
 @click.option("--with-next-week-plan/--no-next-week-plan", default=True,
               help="是否包含下周计划（默认 true）")
-def weekly(from_date, to_date, project, output, fmt, with_next_week_plan):
+@click.option("--detail", "--level", "detail_level", default="full",
+              type=click.Choice(["simple", "full"]),
+              help="周报详略级别（默认 full）")
+@click.option("--save/--no-save", default=True,
+              help="是否保存周报为历史记录（默认 true）")
+def weekly(from_date, to_date, project, output, fmt, with_next_week_plan, detail_level, save):
     """导出周报
 
     生成指定时间范围内的工作进展报告，包括完成的任务、阅读的文献、实验进展等。
@@ -378,7 +515,7 @@ def weekly(from_date, to_date, project, output, fmt, with_next_week_plan):
         return
 
     task_data = get_tasks_in_range(db, start, end, project=project)
-    paper_data = get_papers_in_range(db, start, end, project=project)
+    paper_data = get_papers_in_range_dedup(db, start, end, project=project)
     exp_progress = get_experiment_progress_in_range(db, start, end, project=project)
 
     next_week_tasks = []
@@ -392,21 +529,24 @@ def weekly(from_date, to_date, project, output, fmt, with_next_week_plan):
         content = _generate_markdown_weekly(
             title, start, end, project,
             task_data, paper_data, exp_progress,
-            with_next_week_plan, next_week_tasks
+            with_next_week_plan, next_week_tasks,
+            detail_level
         )
         ext = ".md"
     elif fmt == "text":
         content = _generate_text_weekly(
             title, start, end, project,
             task_data, paper_data, exp_progress,
-            with_next_week_plan, next_week_tasks
+            with_next_week_plan, next_week_tasks,
+            detail_level
         )
         ext = ".txt"
     else:
         content = _generate_json_weekly(
             start, end, project,
             task_data, paper_data, exp_progress,
-            with_next_week_plan, next_week_tasks
+            with_next_week_plan, next_week_tasks,
+            detail_level
         )
         ext = ".json"
 
@@ -422,6 +562,39 @@ def weekly(from_date, to_date, project, output, fmt, with_next_week_plan):
         f.write(content)
 
     print_success(f"周报已导出到: {output_path.absolute()}")
+
+    if save:
+        stats = _calc_weekly_stats(task_data, paper_data, exp_progress)
+        t_stats = stats["tasks"]
+        p_stats = stats["papers"]
+        e_stats = stats["experiments"]
+
+        metrics = {
+            "total_tasks": t_stats["total"],
+            "created_tasks": t_stats["created"],
+            "completed_tasks": t_stats["completed"],
+            "overdue_tasks": t_stats["overdue"],
+            "active_tasks": t_stats["active"],
+            "task_completion_rate": round(t_stats["completion_rate"], 1),
+            "total_experiments": e_stats["total"],
+            "completed_experiments": e_stats["completed"],
+            "total_papers": p_stats["total"],
+            "read_papers": p_stats["read"],
+            "paper_completion_rate": round(p_stats["completion_rate"], 1),
+        }
+
+        report = WeeklyReport(
+            title=title,
+            project=project or "",
+            start_date=start,
+            end_date=end,
+            format=fmt,
+            detail_level=detail_level,
+            content=content,
+            metrics=metrics,
+        )
+        add_weekly_report(db, report)
+        print_info(f"周报已保存为历史记录 (ID: {report.id})")
 
 
 @export.command()
@@ -450,7 +623,7 @@ def archive(project_name: str):
 def remind(project: Optional[str]):
     """提醒未完成事项
 
-    显示今天到期、即将到期、逾期和长期未处理的任务。
+    显示逾期、今日到期、即将到期、远期计划、无截止日期和长期未处理的任务。
     """
     try:
         db = load_db()
@@ -459,7 +632,71 @@ def remind(project: Optional[str]):
         return
 
     reminders = get_reminder_tasks(db, project=project)
+    long_pending = get_long_pending_tasks(db, project=project)
+    reminders["long_pending"] = long_pending
     print_reminder_tasks(reminders)
+
+
+@export.command("reports")
+@click.option("--project", "-p", default=None, help="按项目筛选")
+def reports(project: Optional[str]):
+    """列出历史周报
+
+    显示所有保存的周报历史记录。
+    """
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    report_list = list_weekly_reports(db, project=project)
+    if not report_list:
+        print_warning("暂无周报历史记录")
+        return
+
+    print_weekly_reports_list(report_list, project=project)
+
+
+@export.command("show-report")
+@click.argument("report_id")
+def show_report(report_id: str):
+    """查看单条周报详情
+
+    显示指定 ID 的周报详细信息和内容。
+    """
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    report = get_weekly_report(db, report_id)
+    if not report:
+        print_error(f"未找到周报记录: {report_id}")
+        return
+
+    print_weekly_report_detail(report)
+
+
+@export.command("delete-report")
+@click.argument("report_id")
+def delete_report(report_id: str):
+    """删除单条周报
+
+    删除指定 ID 的周报历史记录。
+    """
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    success = delete_weekly_report(db, report_id)
+    if success:
+        print_success(f"周报已删除: {report_id}")
+    else:
+        print_error(f"未找到周报记录: {report_id}")
 
 
 @export.command()

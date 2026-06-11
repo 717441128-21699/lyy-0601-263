@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from .models import (
     Database, Paper, Note, Task, Project, SubTask,
-    Phase, Milestone, _now_str,
+    Phase, Milestone, WeeklyReport, _now_str,
 )
 
 T = TypeVar("T")
@@ -99,6 +99,11 @@ def _safe_migrate_project(p: dict) -> Project:
     return Project(**p)
 
 
+def _safe_migrate_weekly_report(r: dict) -> WeeklyReport:
+    """兼容旧版数据，迁移 WeeklyReport"""
+    return WeeklyReport(**r)
+
+
 def load_db() -> Database:
     """从文件加载数据库"""
     db_path = get_db_path()
@@ -112,12 +117,14 @@ def load_db() -> Database:
     notes = [_safe_migrate_note(n) for n in data.get("notes", [])]
     tasks = [_safe_migrate_task(t) for t in data.get("tasks", [])]
     projects = [_safe_migrate_project(p) for p in data.get("projects", [])]
+    weekly_reports = [_safe_migrate_weekly_report(r) for r in data.get("weekly_reports", [])]
 
     return Database(
         papers=papers,
         notes=notes,
         tasks=tasks,
         projects=projects,
+        weekly_reports=weekly_reports,
         initialized_at=data.get("initialized_at", _now_str()),
         last_updated=data.get("last_updated", _now_str()),
     )
@@ -419,12 +426,56 @@ def get_procrastinated_tasks(db: Database, project: Optional[str] = None) -> Lis
 
 
 def get_reminder_tasks(db: Database, project: Optional[str] = None) -> Dict[str, List[Task]]:
-    """获取所有需要提醒的任务，按类型分组"""
+    """获取所有需要提醒的任务，按类型分组
+
+    覆盖所有未完成任务：
+    - overdue: 逾期
+    - today: 今日到期
+    - coming_soon: 即将到期（7天内）
+    - long_term: 远期计划（7天以上）
+    - no_deadline: 无截止日期
+    """
+    all_undone = [t for t in db.tasks if not t.is_done]
+    if project:
+        all_undone = [t for t in all_undone if t.project == project]
+
+    today = []
+    coming_soon = []
+    overdue = []
+    long_term = []
+    no_deadline = []
+
+    now = datetime.now().date()
+
+    for t in all_undone:
+        if not t.due_date:
+            no_deadline.append(t)
+            continue
+
+        try:
+            due = datetime.strptime(t.due_date, "%Y-%m-%d").date()
+            days_left = (due - now).days
+
+            if days_left < 0:
+                overdue.append(t)
+            elif days_left == 0:
+                today.append(t)
+            elif 1 <= days_left <= 7:
+                coming_soon.append(t)
+            else:
+                long_term.append(t)
+        except ValueError:
+            no_deadline.append(t)
+
+    def _sort_by_due(tasks):
+        return sorted(tasks, key=lambda x: x.due_date or "9999-99-99")
+
     return {
-        "today": get_today_tasks(db, project),
-        "coming_soon": get_coming_soon_tasks(db, project),
-        "overdue": get_overdue_tasks(db, project),
-        "long_pending": get_long_pending_tasks(db, project),
+        "overdue": _sort_by_due(overdue),
+        "today": _sort_by_due(today),
+        "coming_soon": _sort_by_due(coming_soon),
+        "long_term": _sort_by_due(long_term),
+        "no_deadline": sorted(no_deadline, key=lambda x: x.created_at, reverse=True),
     }
 
 
@@ -893,4 +944,172 @@ def get_completion_rate(db: Database, project: Optional[str] = None) -> dict:
         "today": today,
         "coming_soon": coming_soon,
         "rate": (done / total * 100) if total > 0 else 0,
+    }
+
+
+# ==================== WeeklyReport 相关 ====================
+
+def add_weekly_report(db: Database, report: WeeklyReport) -> WeeklyReport:
+    """添加周报历史记录"""
+    db.weekly_reports.append(report)
+    if report.project:
+        ensure_project(db, report.project)
+    save_db(db)
+    return report
+
+
+def get_weekly_report(db: Database, id: str) -> Optional[WeeklyReport]:
+    """获取周报历史记录"""
+    return _find_by_id(db.weekly_reports, id)
+
+
+def list_weekly_reports(db: Database, project: Optional[str] = None) -> List[WeeklyReport]:
+    """列出周报历史记录"""
+    reports = db.weekly_reports
+    if project:
+        reports = [r for r in reports if r.project == project]
+    return reports
+
+
+def delete_weekly_report(db: Database, id: str) -> bool:
+    """删除周报历史记录"""
+    report = _find_by_id(db.weekly_reports, id)
+    if report:
+        db.weekly_reports.remove(report)
+        save_db(db)
+        return True
+    return False
+
+
+# ==================== Phase 任务统计 ====================
+
+def get_phase_task_count(db: Database, project_name: str, phase_id: str) -> Dict[str, int]:
+    """获取阶段任务统计（直接查 tasks 表，确保数字一致）"""
+    tasks = get_phase_tasks(db, project_name, phase_id)
+    total = len(tasks)
+    done = len([t for t in tasks if t.is_done])
+    blocked = len([t for t in tasks if t.status == "blocked"])
+    return {"total": total, "done": done, "blocked": blocked}
+
+
+# ==================== Paper 去重统计 ====================
+
+def get_papers_in_range_dedup(
+    db: Database,
+    start_date: str,
+    end_date: str,
+    project: Optional[str] = None,
+) -> Dict:
+    """按时间范围获取文献（去重）
+
+    返回: {
+        'total_unique': 去重后总文献数,
+        'read_unique': 时间范围内读完的文献数,
+        'created': 创建时间在范围内的文献列表,
+        'read': 阅读时间在范围内的文献列表,
+        'all_papers': 去重后的所有文献列表
+    }
+    """
+    data = get_papers_in_range(db, start_date, end_date, project)
+    created = data["created"]
+    read = data["read"]
+
+    all_paper_ids = set()
+    all_papers = []
+
+    for p in created + read:
+        if p.id not in all_paper_ids:
+            all_paper_ids.add(p.id)
+            all_papers.append(p)
+
+    total_unique = len(all_papers)
+    read_unique = len(read)
+
+    return {
+        "total_unique": total_unique,
+        "read_unique": read_unique,
+        "created": created,
+        "read": read,
+        "all_papers": all_papers,
+    }
+
+
+# ==================== 实验长期未动检测 ====================
+
+def get_stagnant_experiments(
+    db: Database,
+    project: Optional[str] = None,
+    days: int = 7,
+) -> List[Task]:
+    """获取超过指定天数未更新的实验相关任务"""
+    now = datetime.now()
+    threshold = now - timedelta(days=days)
+
+    tasks = list_tasks(db, project=project, experiment_only=True)
+    stagnant = []
+
+    for t in tasks:
+        if t.is_done:
+            continue
+        updated = _parse_date(t.updated_at)
+        if updated and updated < threshold:
+            stagnant.append(t)
+
+    return stagnant
+
+
+# ==================== 远期任务查询 ====================
+
+def get_long_term_tasks(
+    db: Database,
+    project: Optional[str] = None,
+    days_from_now: int = 14,
+) -> List[Task]:
+    """获取截止日期在指定天数之后的未完成任务（远期计划）"""
+    now = datetime.now()
+    threshold_date = (now + timedelta(days=days_from_now)).date()
+
+    tasks = list_tasks(db, project=project)
+    long_term = []
+
+    for t in tasks:
+        if t.is_done or not t.due_date:
+            continue
+        try:
+            due = datetime.strptime(t.due_date, "%Y-%m-%d").date()
+            if due >= threshold_date:
+                long_term.append(t)
+        except ValueError:
+            pass
+
+    return long_term
+
+
+# ==================== 阶段详情增强 ====================
+
+def get_phase_detail(db: Database, project_name: str, phase_id: str) -> Dict:
+    """获取阶段详情（包含任务统计、阻塞任务、最近更新任务）"""
+    phase = get_phase(db, project_name, phase_id)
+    if not phase:
+        return {}
+
+    tasks = get_phase_tasks(db, project_name, phase_id)
+    done_count = len([t for t in tasks if t.is_done])
+    blocked_tasks = [t for t in tasks if t.status == "blocked"]
+    blocked_count = len(blocked_tasks)
+
+    sorted_tasks = sorted(
+        tasks,
+        key=lambda t: _parse_date(t.updated_at) or datetime.min,
+        reverse=True,
+    )
+    recent_tasks = sorted_tasks[:5]
+
+    return {
+        "phase": phase,
+        "tasks": tasks,
+        "done_count": done_count,
+        "blocked_count": blocked_count,
+        "blocked_tasks": blocked_tasks,
+        "recent_tasks": recent_tasks,
     }

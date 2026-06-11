@@ -6,11 +6,13 @@ from datetime import datetime, timedelta
 from ..storage import (
     load_db, get_completion_rate, get_this_week_completion,
     get_this_week_tasks, list_papers,
+    list_weekly_reports, get_weekly_report,
 )
 from ..utils.formatting import (
     print_completion_stats, print_week_review, print_papers,
     print_success, print_error, print_warning, print_info,
     get_status_label,
+    print_weekly_reports_list, print_weekly_report_detail,
 )
 
 
@@ -221,3 +223,102 @@ def summary():
         print_info("💪 进展不错，继续努力！")
     else:
         print_warning("📌 需要加快进度了，加油！")
+
+    reports = list_weekly_reports(db)
+    if reports:
+        latest = reports[-1]
+        print()
+        print_info(f"📄 最近周报: {latest.title} ({latest.start_date} ~ {latest.end_date})")
+        if latest.metrics:
+            metrics = latest.metrics
+            metric_items = list(metrics.items())[:3]
+            for key, value in metric_items:
+                print_info(f"   {key}: {value}")
+
+
+@review.command()
+@click.option("--project", "-p", default=None, help="按项目筛选")
+def reports(project: Optional[str]):
+    """列出周报历史记录"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    reports_list = list_weekly_reports(db, project=project)
+    if not reports_list:
+        print_warning("暂无周报历史记录")
+        return
+
+    print_weekly_reports_list(reports_list, project=project)
+
+
+@review.command(name="show-report")
+@click.argument("report_id")
+def show_report(report_id: str):
+    """查看单条周报详情"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    report = get_weekly_report(db, report_id)
+    if not report:
+        print_error(f"未找到周报 ID: {report_id}")
+        return
+
+    print_weekly_report_detail(report)
+
+
+@review.command()
+@click.option("--project", "-p", default=None, help="按项目筛选")
+def trend(project: Optional[str]):
+    """查看关键指标变化趋势（最近5份周报）"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    reports_list = list_weekly_reports(db, project=project)
+    if not reports_list:
+        print_warning("暂无周报历史记录，无法查看趋势")
+        return
+
+    recent_reports = reports_list[-5:] if len(reports_list) >= 5 else reports_list
+
+    from rich.table import Table
+    from rich.console import Console
+
+    console = Console()
+
+    table = Table(title=f"📈 指标变化趋势（最近 {len(recent_reports)} 份周报）", show_header=True, header_style="bold")
+    table.add_column("周报", style="bold", width=20)
+    table.add_column("总任务数", justify="right")
+    table.add_column("完成数", justify="right")
+    table.add_column("完成率", justify="right")
+    table.add_column("文献数", justify="right")
+    table.add_column("已读文献", justify="right")
+
+    for report in recent_reports:
+        metrics = report.metrics or {}
+        total_tasks = metrics.get("总任务数", metrics.get("total_tasks", "-"))
+        done_tasks = metrics.get("完成数", metrics.get("done_tasks", "-"))
+        completion_rate = metrics.get("完成率", metrics.get("completion_rate", "-"))
+        if isinstance(completion_rate, float):
+            completion_rate = f"{completion_rate:.1f}%"
+        total_papers = metrics.get("总文献数", metrics.get("total_papers", "-"))
+        read_papers = metrics.get("已读文献", metrics.get("read_papers", "-"))
+
+        table.add_row(
+            f"{report.title[:18]}",
+            str(total_tasks),
+            str(done_tasks),
+            str(completion_rate),
+            str(total_papers),
+            str(read_papers),
+        )
+
+    console.print(table)

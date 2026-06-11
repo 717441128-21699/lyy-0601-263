@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TextColumn
 from rich.text import Text
 
-from ..models import Paper, Note, Task, Project, Phase, Milestone
+from ..models import Paper, Note, Task, Project, Phase, Milestone, WeeklyReport
 
 console = Console()
 
@@ -363,7 +363,8 @@ def print_projects(projects: List[Project], title: str = "项目列表") -> None
     console.print(table)
 
 
-def print_phases(phases: List[Phase], project_name: str) -> None:
+def print_phases(phases: List[Phase], project_name: str,
+                 phases_stats: Optional[Dict[str, dict]] = None) -> None:
     title = f"项目阶段列表 - {project_name}"
     table = Table(title=title, show_lines=False)
     table.add_column("ID", style="dim", width=10)
@@ -371,12 +372,25 @@ def print_phases(phases: List[Phase], project_name: str) -> None:
     table.add_column("状态", justify="center", width=10)
     table.add_column("目标日期", justify="center", width=12)
     table.add_column("完成日期", justify="center", width=12)
-    table.add_column("关联任务数", justify="center", width=10)
+    table.add_column("任务", justify="center", width=8)
+    table.add_column("已完成", justify="center", width=8)
+    table.add_column("阻塞", justify="center", width=8)
 
     for ph in sorted(phases, key=lambda x: x.order):
         status_style = get_phase_status_style(ph.status)
         status_label = get_phase_status_label(ph.status)
-        task_count = len(ph.task_ids)
+
+        if phases_stats and ph.id in phases_stats:
+            stats = phases_stats[ph.id]
+            total = stats.get("total", 0)
+            done = stats.get("done", 0)
+            blocked = stats.get("blocked", 0)
+        else:
+            total = len(ph.task_ids)
+            done = 0
+            blocked = 0
+
+        blocked_style = "red" if blocked > 0 else "white"
 
         table.add_row(
             ph.id,
@@ -384,7 +398,9 @@ def print_phases(phases: List[Phase], project_name: str) -> None:
             Text(status_label, style=status_style),
             ph.target_date or "-",
             ph.done_at or "-",
-            str(task_count),
+            str(total),
+            Text(str(done), style="green"),
+            Text(str(blocked), style=blocked_style),
         )
 
     console.print(table)
@@ -516,16 +532,25 @@ def print_reminder_tasks(reminders_dict: Dict[str, List[Task]]) -> None:
     today = reminders_dict.get('today', [])
     coming_soon = reminders_dict.get('coming_soon', [])
     overdue = reminders_dict.get('overdue', [])
+    long_term = reminders_dict.get('long_term', [])
+    no_deadline = reminders_dict.get('no_deadline', [])
     long_pending = reminders_dict.get('long_pending', [])
 
-    total = len(today) + len(coming_soon) + len(overdue) + len(long_pending)
+    total = len(today) + len(coming_soon) + len(overdue) + len(long_term) + len(no_deadline)
     if total == 0:
         print_success("太棒了！没有需要提醒的任务 🎉")
         return
 
     content = []
-    content.append(f"[bold]共 {total} 项任务需要关注[/bold]")
+    content.append(f"[bold]共 {total} 项未完成任务[/bold]")
     content.append("")
+
+    if overdue:
+        content.append(f"[bold red]⚠ 逾期 ({len(overdue)}):[/bold red]")
+        for t in overdue:
+            title_text = t.title[:50] + "..." if len(t.title) > 50 else t.title
+            content.append(f"  [{t.id}] [strike]{t.due_date or '-'}[/strike] {title_text}")
+        content.append("")
 
     if today:
         content.append(f"[bold red]📅 今天到期 ({len(today)}):[/bold red]")
@@ -536,26 +561,34 @@ def print_reminder_tasks(reminders_dict: Dict[str, List[Task]]) -> None:
         content.append("")
 
     if coming_soon:
-        content.append(f"[bold yellow]⏰ 即将到期 ({len(coming_soon)}):[/bold yellow]")
+        content.append(f"[bold yellow]⏰ 即将到期（7天内）({len(coming_soon)}):[/bold yellow]")
         for t in coming_soon:
             title_text = t.title[:50] + "..." if len(t.title) > 50 else t.title
             content.append(f"  [{t.id}] {t.due_date or '-'} {title_text}")
         content.append("")
 
-    if overdue:
-        content.append(f"[bold red]⚠ 逾期 ({len(overdue)}):[/bold red]")
-        for t in overdue:
+    if long_term:
+        content.append(f"[bold cyan]📅 远期计划 ({len(long_term)}):[/bold cyan]")
+        for t in long_term:
             title_text = t.title[:50] + "..." if len(t.title) > 50 else t.title
-            content.append(f"  [{t.id}] [strike]{t.due_date or '-'}[/strike] {title_text}")
+            priority_style = get_priority_style(t.priority)
+            content.append(f"  [{t.id}] [{priority_style}]{get_priority_label(t.priority)}[/] {title_text} [dim](截止: {t.due_date})[/]")
         content.append("")
 
-    if long_pending:
-        content.append(f"[bold dim]⌛ 长期未处理 ({len(long_pending)}):[/bold dim]")
-        for t in long_pending:
+    if no_deadline:
+        content.append(f"[bold dim]📌 无截止日期 ({len(no_deadline)}):[/bold dim]")
+        for t in no_deadline:
             title_text = t.title[:50] + "..." if len(t.title) > 50 else t.title
             status_style = get_status_style(t.status)
             status_label = get_status_label(t.status)
             content.append(f"  [{t.id}] [{status_style}]{status_label}[/] {title_text}")
+        content.append("")
+
+    if long_pending:
+        content.append(f"[bold magenta]⌛ 长期未处理（超过14天）({len(long_pending)}):[/bold magenta]")
+        for t in long_pending:
+            title_text = t.title[:50] + "..." if len(t.title) > 50 else t.title
+            content.append(f"  [{t.id}] {title_text} [dim](创建: {t.created_at.split()[0]})[/]")
 
     console.print(Panel("\n".join(content), title="🔔 任务提醒", expand=False))
 
@@ -631,3 +664,230 @@ def print_warning(msg: str) -> None:
 
 def print_info(msg: str) -> None:
     console.print(f"[cyan]ℹ {msg}[/]")
+
+
+def print_project_review(
+    project: Project,
+    progress: dict,
+    phases_data: List[dict],
+    stagnant_exp: List[Task],
+    long_term_tasks: List[Task],
+) -> None:
+    content = []
+
+    content.append(f"[bold]项目名称:[/bold] {project.name}")
+    content.append(f"[bold]描述:[/bold] {project.description or '-'}")
+    status = "已归档" if project.archived else "进行中"
+    status_style = "dim strike" if project.archived else "green"
+    content.append(f"[bold]状态:[/bold] [{status_style}]{status}[/]")
+    content.append("")
+
+    task_rate = progress.get('task_completion', 0)
+    paper_rate = progress.get('paper_progress', 0)
+    content.append("[bold]📊 整体进度:[/bold]")
+    content.append(f"  任务完成率: [bold]{task_rate:.1f}%[/] "
+                   f"({progress.get('done_tasks', 0)}/{progress.get('total_tasks', 0)})")
+    content.append(f"  阅读进度: [bold]{paper_rate:.1f}%[/] "
+                   f"({progress.get('read_papers', 0)}/{progress.get('total_papers', 0)})")
+    content.append(f"  阶段: {progress.get('done_phases', 0)}/{progress.get('total_phases', 0)}")
+    content.append(f"  里程碑: {progress.get('done_milestones', 0)}/{progress.get('total_milestones', 0)}")
+    content.append("")
+
+    if phases_data:
+        content.append("[bold]📋 阶段概览:[/bold]")
+        for pd in phases_data:
+            phase = pd.get('phase')
+            if not phase:
+                continue
+            phase_status_style = get_phase_status_style(phase.status)
+            phase_status_label = get_phase_status_label(phase.status)
+            total = pd.get('total', 0)
+            done = pd.get('done', 0)
+            blocked = pd.get('blocked', 0)
+            blocked_tasks = pd.get('blocked_tasks', [])
+
+            content.append(f"  [{phase.order}] [{phase_status_style}]{phase_status_label}[/] "
+                           f"[bold]{phase.name}[/]")
+            content.append(f"      目标日期: {phase.target_date or '-'} | "
+                           f"任务: {done}/{total} | 阻塞: [red]{blocked}[/]")
+
+            if blocked_tasks:
+                content.append(f"      [red]阻塞任务:[/]")
+                for bt in blocked_tasks[:3]:
+                    bt_title = bt.title[:30] + "..." if len(bt.title) > 30 else bt.title
+                    content.append(f"        • [{bt.id}] {bt_title}")
+                if len(blocked_tasks) > 3:
+                    content.append(f"        [dim]...还有 {len(blocked_tasks) - 3} 项[/]")
+            content.append("")
+
+    if stagnant_exp:
+        content.append("[bold]⏸ 停滞实验:[/bold]")
+        for t in stagnant_exp[:5]:
+            title_text = t.title[:40] + "..." if len(t.title) > 40 else t.title
+            content.append(f"  • [{t.id}] [yellow]{title_text}[/] [dim](更新: {t.updated_at})[/]")
+        if len(stagnant_exp) > 5:
+            content.append(f"  [dim]...还有 {len(stagnant_exp) - 5} 项[/]")
+        content.append("")
+
+    if long_term_tasks:
+        content.append("[bold]📅 远期计划:[/bold]")
+        for t in long_term_tasks[:5]:
+            title_text = t.title[:40] + "..." if len(t.title) > 40 else t.title
+            content.append(f"  • [{t.id}] {title_text} [dim](截止: {t.due_date})[/]")
+        if len(long_term_tasks) > 5:
+            content.append(f"  [dim]...还有 {len(long_term_tasks) - 5} 项[/]")
+        content.append("")
+
+    if project.milestones:
+        content.append("[bold]🎯 里程碑:[/bold]")
+        for m in project.milestones:
+            ms_status_style = get_milestone_status_style(m.status)
+            ms_status_label = get_milestone_status_label(m.status)
+            date_info = m.target_date or "-"
+            content.append(f"  • [{ms_status_style}]{ms_status_label}[/] {m.name} "
+                           f"[dim](目标: {date_info})[/]")
+        content.append("")
+
+    content.append(f"[dim]创建: {project.created_at}[/]")
+
+    console.print(Panel("\n".join(content), title=f"项目复盘 - {project.name}", expand=False))
+
+    if progress.get('total_tasks', 0) > 0:
+        progress_bar = Progress(
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            BarColumn(bar_width=30),
+        )
+        with progress_bar:
+            task_id = progress_bar.add_task("任务完成进度", total=progress['total_tasks'])
+            progress_bar.update(task_id, completed=progress['done_tasks'])
+
+
+def print_phase_detail(phase_detail_dict: dict) -> None:
+    phase = phase_detail_dict.get('phase')
+    if not phase:
+        print_warning("阶段数据为空")
+        return
+
+    content = []
+    content.append(f"[bold]阶段名称:[/bold] {phase.name}")
+    content.append(f"[bold]描述:[/bold] {phase.description or '-'}")
+    status_style = get_phase_status_style(phase.status)
+    status_label = get_phase_status_label(phase.status)
+    content.append(f"[bold]状态:[/bold] [{status_style}]{status_label}[/]")
+    content.append(f"[bold]目标日期:[/bold] {phase.target_date or '-'}")
+    content.append(f"[bold]完成日期:[/bold] {phase.done_at or '-'}")
+    content.append(f"[bold]顺序:[/bold] {phase.order}")
+
+    done_count = phase_detail_dict.get('done_count', 0)
+    blocked_count = phase_detail_dict.get('blocked_count', 0)
+    tasks = phase_detail_dict.get('tasks', [])
+    total = len(tasks)
+    content.append(f"[bold]任务统计:[/bold] 共 {total} 项 | 已完成 {done_count} | 阻塞 [red]{blocked_count}[/]")
+    content.append("")
+    content.append(f"[dim]创建: {phase.created_at} | 更新: {phase.updated_at}[/]")
+
+    console.print(Panel("\n".join(content), title=f"阶段详情 [{phase.id}]", expand=False))
+
+    blocked_tasks = phase_detail_dict.get('blocked_tasks', [])
+    if blocked_tasks:
+        print()
+        print_tasks(blocked_tasks, title=f"🔴 阻塞任务 ({len(blocked_tasks)})")
+
+    if tasks:
+        print()
+        print_tasks(tasks, title=f"📋 任务列表 ({len(tasks)})")
+
+    recent_tasks = phase_detail_dict.get('recent_tasks', [])
+    if recent_tasks:
+        print()
+        table = Table(title="🕐 最近更新的任务", show_lines=False)
+        table.add_column("ID", style="dim", width=10)
+        table.add_column("标题", style="bold", no_wrap=False)
+        table.add_column("状态", justify="center", width=10)
+        table.add_column("更新时间", style="dim", width=20)
+
+        for t in recent_tasks:
+            t_status_style = get_status_style(t.status)
+            t_status_label = get_status_label(t.status)
+            title_text = t.title[:45] + "..." if len(t.title) > 45 else t.title
+            table.add_row(
+                t.id,
+                title_text,
+                Text(t_status_label, style=t_status_style),
+                t.updated_at,
+            )
+
+        console.print(table)
+
+
+def print_weekly_reports_list(reports: List[WeeklyReport], project: Optional[str] = None) -> None:
+    title = "周报历史记录"
+    if project:
+        title += f" - {project}"
+
+    table = Table(title=title, show_lines=False)
+    table.add_column("ID", style="dim", width=10)
+    table.add_column("标题", style="bold", no_wrap=False)
+    table.add_column("项目", width=15)
+    table.add_column("时间范围", justify="center", width=22)
+    table.add_column("详略级别", justify="center", width=10)
+    table.add_column("创建时间", style="dim", width=20)
+
+    detail_labels = {
+        "simple": "简略",
+        "full": "详细",
+    }
+
+    for r in reports:
+        time_range = f"{r.start_date} ~ {r.end_date}"
+        detail_label = detail_labels.get(r.detail_level, r.detail_level)
+        title_text = r.title[:30] + "..." if len(r.title) > 30 else r.title
+
+        table.add_row(
+            r.id,
+            title_text,
+            r.project or "-",
+            time_range,
+            detail_label,
+            r.created_at,
+        )
+
+    console.print(table)
+
+
+def print_weekly_report_detail(report: WeeklyReport) -> None:
+    content = []
+    content.append(f"[bold]标题:[/bold] {report.title}")
+    content.append(f"[bold]项目:[/bold] {report.project or '-'}")
+    content.append(f"[bold]时间范围:[/bold] {report.start_date} ~ {report.end_date}")
+
+    detail_labels = {
+        "simple": "简略",
+        "full": "详细",
+    }
+    detail_label = detail_labels.get(report.detail_level, report.detail_level)
+    format_label = report.format.upper()
+    content.append(f"[bold]详略级别:[/bold] {detail_label}")
+    content.append(f"[bold]格式:[/bold] {format_label}")
+
+    metrics = report.metrics or {}
+    if metrics:
+        content.append("")
+        content.append("[bold]📊 指标摘要:[/bold]")
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                content.append(f"  {key}: [bold]{value}[/]")
+            else:
+                content.append(f"  {key}: {value}")
+
+    content.append("")
+    content.append(f"[dim]创建时间: {report.created_at}[/]")
+
+    console.print(Panel("\n".join(content), title=f"周报详情 [{report.id}]", expand=False))
+
+    if report.content:
+        print()
+        if report.format == "markdown":
+            console.print(Panel(report.content, title="📝 周报内容", expand=False))
+        else:
+            console.print(Panel(report.content, title="📝 周报内容", expand=False))
