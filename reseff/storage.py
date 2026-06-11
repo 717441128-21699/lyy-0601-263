@@ -432,6 +432,22 @@ def get_task_paper(db: Database, task_id: str) -> Optional[Paper]:
     return None
 
 
+def get_task_phase(db: Database, task_id: str) -> Optional[Phase]:
+    """获取任务关联的阶段"""
+    task = get_task(db, task_id)
+    if not task or not task.phase_id or not task.project:
+        return None
+    return get_phase(db, task.project, task.phase_id)
+
+
+def get_task_milestone(db: Database, task_id: str) -> Optional[Milestone]:
+    """获取任务关联的里程碑"""
+    task = get_task(db, task_id)
+    if not task or not task.milestone_id or not task.project:
+        return None
+    return get_milestone(db, task.project, task.milestone_id)
+
+
 def get_today_tasks(db: Database, project: Optional[str] = None) -> List[Task]:
     """获取今日到期的任务"""
     tasks = [t for t in db.tasks if t.is_due_today]
@@ -1389,3 +1405,267 @@ def get_all_projects_health(db: Database) -> List[Dict]:
             results.append(health)
     results.sort(key=lambda h: h["score"], reverse=True)
     return results
+
+
+# ==================== 项目风险分析 ====================
+
+def get_project_phase_risks(db: Database, project_name: str) -> List[Dict]:
+    """分析项目各阶段的风险、依赖和影响的里程碑
+
+    返回每个阶段的:
+      - phase: 阶段对象
+      - risk_level: high/medium/low
+      - risk_reason: 风险原因
+      - blocked_milestones: 受影响的里程碑列表
+      - prerequisite_phases: 前置阶段（order 更小的阶段）
+    """
+    project = get_project(db, project_name)
+    if not project:
+        return []
+
+    phases = sorted(project.phases, key=lambda p: p.order)
+    milestones = project.milestones
+
+    results = []
+    for idx, ph in enumerate(phases):
+        prereqs = phases[:idx]
+        phase_detail = get_phase_detail(db, project_name, ph.id)
+        blocked_count = phase_detail.get("blocked_count", 0) if phase_detail else 0
+        total = phase_detail.get("total", 0) if phase_detail else 0
+        done = phase_detail.get("done_count", 0) if phase_detail else 0
+
+        affected_milestones = []
+        for ms in milestones:
+            if ph.id in (ms.phase_ids or []):
+                affected_milestones.append(ms)
+            if ms.task_ids and phase_detail:
+                phase_task_ids = {t.id for t in phase_detail.get("tasks", [])}
+                if phase_task_ids & set(ms.task_ids):
+                    affected_milestones.append(ms)
+        seen = set()
+        unique_ms = []
+        for ms in affected_milestones:
+            if ms.id not in seen:
+                seen.add(ms.id)
+                unique_ms.append(ms)
+        affected_milestones = unique_ms
+
+        risk_level = "low"
+        risk_reasons = []
+
+        if ph.status == "blocked":
+            risk_level = "high"
+            risk_reasons.append("阶段被标记为阻塞")
+        elif ph.status == "active" and blocked_count > 0:
+            risk_level = "high"
+            risk_reasons.append(f"阶段内有 {blocked_count} 个阻塞任务")
+
+        if prereqs:
+            unfinished_prereqs = [p for p in prereqs if p.status != "done"]
+            if unfinished_prereqs and ph.status == "active":
+                risk_level = "high" if risk_level != "high" else risk_level
+                names = ", ".join(p.name for p in unfinished_prereqs[:2])
+                risk_reasons.append(f"前置阶段未完成: {names}")
+
+        if ph.status == "pending" and idx == 0:
+            risk_reasons.append("尚未启动的第一个阶段")
+        elif ph.status == "pending":
+            risk_reasons.append("待启动")
+
+        if total > 0 and done == 0 and ph.status == "active":
+            if risk_level == "low":
+                risk_level = "medium"
+            risk_reasons.append("阶段已启动但任务零进展")
+
+        if not risk_reasons:
+            risk_reasons.append("进展正常")
+
+        results.append({
+            "phase": ph,
+            "risk_level": risk_level,
+            "risk_reasons": risk_reasons,
+            "affected_milestones": affected_milestones,
+            "prerequisite_phases": prereqs,
+            "stats": {
+                "total": total,
+                "done": done,
+                "blocked": blocked_count,
+            },
+        })
+
+    return results
+
+
+def get_stale_unblocked_tasks(db: Database, project: Optional[str] = None,
+                              stale_days: int = 7) -> List[Task]:
+    """获取长期未更新（>stale_days 天）但状态不是 blocked 的任务"""
+    now = datetime.now()
+    results = []
+    for t in db.tasks:
+        if t.status == "blocked" or t.is_done:
+            continue
+        if project and t.project != project:
+            continue
+        upd = t.updated_at or t.created_at
+        try:
+            upd_dt = datetime.strptime(upd, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            try:
+                upd_dt = datetime.strptime(upd.split()[0], "%Y-%m-%d")
+            except (ValueError, AttributeError):
+                continue
+        days_since = (now - upd_dt).days
+        if days_since >= stale_days:
+            results.append(t)
+    results.sort(key=lambda x: x.updated_at or x.created_at)
+    return results
+
+
+# ==================== 月度复盘 - 行动清单 ====================
+
+def classify_project_actions(projects_health: List[Dict]) -> Dict[str, List[Dict]]:
+    """根据健康度把项目分类为 推进/暂停/归档/观察 四类行动清单"""
+    actions = {"推进": [], "观察": [], "暂停": [], "归档": []}
+
+    for h in projects_health:
+        level = h["level"]
+        score = h["score"]
+        m = h["metrics"]
+
+        stagnant_ratio = 0
+        if m["total_tasks"] > 0:
+            stagnant_ratio = (m["stagnant_count"] + m["blocked_count"]) / m["total_tasks"]
+
+        no_recent_progress = (
+            score < 30
+            and m["task_completion_rate"] < 15
+            and m["stagnant_count"] >= 2
+        )
+
+        needs_archive = (
+            no_recent_progress
+            and len(h.get("recent_weekly_reports", [])) >= 3
+            and m["total_tasks"] >= 3
+        )
+
+        if level in ("warning", "critical") and stagnant_ratio >= 0.5 and not needs_archive:
+            actions["暂停"].append(h)
+        elif needs_archive:
+            actions["归档"].append(h)
+        elif level in ("excellent", "good"):
+            actions["推进"].append(h)
+        else:
+            actions["观察"].append(h)
+
+    return actions
+
+
+def generate_monthly_markdown(projects_health: List[Dict],
+                               actions: Optional[Dict[str, List[Dict]]] = None) -> str:
+    """生成月度复盘 markdown 文本"""
+    if actions is None:
+        actions = classify_project_actions(projects_health)
+
+    from datetime import datetime as _dt
+    today = _dt.now().strftime("%Y-%m-%d")
+
+    lines = []
+    lines.append(f"# 📊 月度项目健康复盘")
+    lines.append(f"> 生成时间: {today}")
+    lines.append("")
+
+    total = len(projects_health)
+    push_count = len(actions["推进"])
+    watch_count = len(actions["观察"])
+    pause_count = len(actions["暂停"])
+    archive_count = len(actions["归档"])
+
+    lines.append("## 📋 总览")
+    lines.append("")
+    lines.append(f"- 活跃项目总数: **{total}**")
+    lines.append(f"- 🟢 建议推进: **{push_count}**")
+    lines.append(f"- 🟡 建议观察: **{watch_count}**")
+    lines.append(f"- 🟠 建议暂停: **{pause_count}**")
+    lines.append(f"- 🔴 建议归档: **{archive_count}**")
+    lines.append("")
+
+    for action_label, emoji in [("推进", "🟢"), ("观察", "🟡"), ("暂停", "🟠"), ("归档", "🔴")]:
+        action_projects = actions.get(action_label, [])
+        if not action_projects:
+            continue
+
+        lines.append(f"## {emoji} 建议{action_label} ({len(action_projects)})")
+        lines.append("")
+
+        for h in action_projects:
+            proj = h["project"]
+            m = h["metrics"]
+            level = h["level"]
+            suggestion = h["suggestion"]
+
+            level_emoji = {
+                "excellent": "🌟",
+                "good": "💪",
+                "warning": "⚠️",
+                "critical": "🚨",
+            }.get(level, "❓")
+
+            lines.append(f"### {level_emoji} {proj.name} (健康分: {h['score']})")
+            lines.append("")
+            if proj.description:
+                lines.append(f"> {proj.description}")
+                lines.append("")
+            lines.append(f"**建议**: {suggestion}")
+            lines.append("")
+
+            lines.append("| 维度 | 进度 | 完成率 |")
+            lines.append("| --- | --- | --- |")
+            lines.append(f"| 任务 | {m['done_tasks']}/{m['total_tasks']} | {m['task_completion_rate']:.1f}% |")
+            lines.append(f"| 阶段 | {m['done_phases']}/{m['total_phases']} | {m['phase_rate']:.1f}% |")
+            lines.append(f"| 文献 | {m['read_papers']}/{m['total_papers']} | {m['paper_rate']:.1f}% |")
+            lines.append(f"| 阻塞 | {m['blocked_count']}项 ({m['blocked_ratio']:.0f}%) | - |")
+            lines.append(f"| 逾期 | {m['overdue_count']}项 ({m['overdue_ratio']:.0f}%) | - |")
+            lines.append(f"| 停滞实验 | {m['stagnant_count']}项 | - |")
+            lines.append("")
+
+            reports = h.get("recent_weekly_reports", [])
+            if reports:
+                lines.append("#### 📈 最近周报趋势")
+                lines.append("")
+                lines.append("| 时间范围 | 任务完成 | 任务完成率 | 文献阅读 | 阅读完成率 |")
+                lines.append("| --- | --- | --- | --- | --- |")
+                for r in reports:
+                    nm = normalize_weekly_metrics(r.metrics or {})
+                    time_range = f"{r.start_date} ~ {r.end_date}"
+                    lines.append(f"| {time_range} | {nm['completed_tasks']}/{nm['total_tasks']} | "
+                                 f"{nm['task_completion_rate']:.1f}% | "
+                                 f"{nm['read_papers']}/{nm['total_papers']} | "
+                                 f"{nm['paper_completion_rate']:.1f}% |")
+                lines.append("")
+
+            blocked = h.get("blocked_tasks", [])
+            if blocked:
+                lines.append("#### 🚧 阻塞任务")
+                lines.append("")
+                for bt in blocked[:5]:
+                    reason = bt.description[:80] if bt.description else "未注明原因"
+                    if bt.description and len(bt.description) > 80:
+                        reason = bt.description[:80] + "..."
+                    lines.append(f"- `[{bt.id}]` **{bt.title}**")
+                    lines.append(f"  - 阻塞原因: {reason}")
+                if len(blocked) > 5:
+                    lines.append(f"- *还有 {len(blocked) - 5} 项阻塞任务...*")
+                lines.append("")
+
+            stagnant = h.get("stagnant_experiments", [])
+            if stagnant:
+                lines.append("#### ⏸ 长期未动实验")
+                lines.append("")
+                for se in stagnant[:5]:
+                    upd = se.updated_at[:10] if se.updated_at else "-"
+                    lines.append(f"- `[{se.id}]` **{se.title}** (最近更新: {upd})")
+                if len(stagnant) > 5:
+                    lines.append(f"- *还有 {len(stagnant) - 5} 项停滞实验...*")
+                lines.append("")
+
+    return "\n".join(lines) + "\n"

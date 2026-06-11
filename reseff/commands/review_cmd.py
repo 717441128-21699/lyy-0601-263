@@ -9,6 +9,7 @@ from ..storage import (
     list_weekly_reports, get_weekly_report,
     normalize_weekly_metrics,
     get_all_projects_health, calc_project_health,
+    classify_project_actions, generate_monthly_markdown,
 )
 from ..utils.formatting import (
     print_completion_stats, print_week_review, print_papers,
@@ -335,11 +336,15 @@ def trend(project: Optional[str]):
 
 @review.command()
 @click.option("--project", "-p", default=None, help="按项目查看详细健康分析，不指定则显示全项目概览")
-def monthly(project: Optional[str]):
-    """月度复盘 - 项目健康概览
+@click.option("--export", "-e", "export_path", default=None,
+              type=click.Path(dir_okay=False),
+              help="导出月度复盘为 Markdown 文件")
+def monthly(project: Optional[str], export_path: Optional[str]):
+    """月度复盘 - 项目健康概览与行动清单
 
     综合最近几周周报、阶段推进、阻塞情况和停滞实验，
-    计算健康度得分，并给出推进/暂停/归档建议。
+    计算健康度得分，给出推进/观察/暂停/归档行动清单，
+    可一键导出为 Markdown。
     """
     try:
         db = load_db()
@@ -353,14 +358,35 @@ def monthly(project: Optional[str]):
             print_error(f"未找到项目: {project}")
             return
         print_monthly_project_detail(health)
+
+        if export_path:
+            all_health = [health]
+            md = generate_monthly_markdown(all_health)
+            try:
+                with open(export_path, "w", encoding="utf-8") as f:
+                    f.write(md)
+                print_success(f"月度复盘已导出: {export_path}")
+            except Exception as ex:
+                print_error(f"导出失败: {ex}")
     else:
         all_health = get_all_projects_health(db)
         if not all_health:
             print_warning("暂无活跃项目")
             return
-        print_monthly_overview(all_health)
+
+        actions = classify_project_actions(all_health)
+        print_monthly_overview(all_health, actions=actions)
 
         if len(all_health) <= 3:
             for h in all_health:
                 print()
                 print_monthly_project_detail(h)
+
+        if export_path:
+            md = generate_monthly_markdown(all_health, actions=actions)
+            try:
+                with open(export_path, "w", encoding="utf-8") as f:
+                    f.write(md)
+                print_success(f"月度复盘已导出: {export_path}")
+            except Exception as ex:
+                print_error(f"导出失败: {ex}")

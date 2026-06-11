@@ -10,6 +10,7 @@ from ..storage import (
     add_subtask, toggle_subtask, get_paper, get_project, add_project,
     ensure_project, parse_date,
     validate_phase_id, validate_milestone_id,
+    get_task_paper, get_task_notes, get_task_phase, get_task_milestone,
 )
 from ..utils.formatting import (
     print_tasks, print_task_detail, print_success, print_error,
@@ -55,27 +56,42 @@ def add(title: str, description: str, project: str, priority: str,
         print_error(f"日期格式无效: {due}，请使用 YYYY-MM-DD 格式")
         return
 
-    if project:
-        existed = get_project(db, project) is not None
-        ensure_project(db, project)
-        if not existed:
-            print_success(f"已自动创建新项目: {project}")
+    project_existed = get_project(db, project) is not None if project else True
+
+    if project and not project_existed and (phase or milestone):
+        print_error(f"项目 '{project}' 不存在，无法关联阶段/里程碑。"
+                    f"请先用 'reseff plan project add' 等命令创建项目并设置阶段/里程碑后再关联。")
+        return
 
     if paper and not get_paper(db, paper):
         print_error(f"未找到 ID 为 {paper} 的文献")
         return
 
     if phase:
-        ok, msg = validate_phase_id(db, project, phase)
+        target_project_for_validation = project if project_existed else None
+        if not target_project_for_validation:
+            print_error(f"项目 '{project}' 不存在，无法关联阶段。"
+                        f"请先创建项目并设置阶段。")
+            return
+        ok, msg = validate_phase_id(db, target_project_for_validation, phase)
         if not ok:
             print_error(msg)
             return
 
     if milestone:
-        ok, msg = validate_milestone_id(db, project, milestone)
+        target_project_for_validation = project if project_existed else None
+        if not target_project_for_validation:
+            print_error(f"项目 '{project}' 不存在，无法关联里程碑。"
+                        f"请先创建项目并设置里程碑。")
+            return
+        ok, msg = validate_milestone_id(db, target_project_for_validation, milestone)
         if not ok:
             print_error(msg)
             return
+
+    if project and not project_existed:
+        ensure_project(db, project)
+        print_success(f"已自动创建新项目: {project}")
 
     tags = list(tag)
     task = Task(
@@ -170,7 +186,9 @@ def show(id: str):
 
     paper = get_task_paper(db, id)
     notes = get_task_notes(db, id)
-    print_task_detail(task, paper=paper, notes=notes)
+    phase = get_task_phase(db, id)
+    milestone = get_task_milestone(db, id)
+    print_task_detail(task, paper=paper, notes=notes, phase=phase, milestone=milestone)
 
 
 @task.command()
@@ -204,42 +222,68 @@ def update(id: str, title: Optional[str], description: Optional[str],
         print_error(f"未找到 ID 为 {id} 的任务")
         return
 
-    kwargs = {}
-    if title is not None:
-        kwargs["title"] = title
-    if description is not None:
-        kwargs["description"] = description
-    if project is not None:
-        kwargs["project"] = project
-        if project:
-            existed = get_project(db, project) is not None
-            ensure_project(db, project)
-            if not existed:
-                print_success(f"已自动创建新项目: {project}")
-    if priority is not None:
-        kwargs["priority"] = priority
-    if status is not None:
-        kwargs["status"] = status
+    new_project = project
+    current_project = task.project
+    target_project = new_project if new_project is not None else current_project
+
+    target_project_existed = (
+        get_project(db, target_project) is not None if target_project else True
+    )
+
     if due is not None:
         due_date = parse_date(due)
         if not due_date:
             print_error(f"日期格式无效: {due}，请使用 YYYY-MM-DD 格式")
             return
-        kwargs["due_date"] = due_date
 
-    target_project = kwargs.get("project", task.project)
+    if new_project is not None and new_project and not target_project_existed and (phase is not None or milestone is not None):
+        print_error(f"项目 '{new_project}' 不存在，无法关联阶段/里程碑。"
+                    f"请先创建项目并设置阶段/里程碑后再关联。")
+        return
 
     if phase is not None:
+        if not target_project:
+            print_error("任务未指定项目，无法关联阶段。")
+            return
+        if not target_project_existed:
+            print_error(f"项目 '{target_project}' 不存在，无法关联阶段。")
+            return
         ok, msg = validate_phase_id(db, target_project, phase)
         if not ok:
             print_error(msg)
             return
-        kwargs["phase_id"] = phase
+
     if milestone is not None:
+        if not target_project:
+            print_error("任务未指定项目，无法关联里程碑。")
+            return
+        if not target_project_existed:
+            print_error(f"项目 '{target_project}' 不存在，无法关联里程碑。")
+            return
         ok, msg = validate_milestone_id(db, target_project, milestone)
         if not ok:
             print_error(msg)
             return
+
+    kwargs = {}
+    if title is not None:
+        kwargs["title"] = title
+    if description is not None:
+        kwargs["description"] = description
+    if new_project is not None:
+        kwargs["project"] = new_project
+        if new_project and not target_project_existed:
+            ensure_project(db, new_project)
+            print_success(f"已自动创建新项目: {new_project}")
+    if priority is not None:
+        kwargs["priority"] = priority
+    if status is not None:
+        kwargs["status"] = status
+    if due is not None:
+        kwargs["due_date"] = parse_date(due)
+    if phase is not None:
+        kwargs["phase_id"] = phase
+    if milestone is not None:
         kwargs["milestone_id"] = milestone
     if tag:
         new_tags = list(set(task.tags + list(tag)))

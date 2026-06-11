@@ -13,6 +13,7 @@ from ..storage import (
     get_current_phase, ensure_project, parse_date,
     get_phase_detail, get_stagnant_experiments, get_long_term_tasks,
     get_phase_task_count,
+    get_project_phase_risks, get_stale_unblocked_tasks,
 )
 from ..utils.formatting import (
     print_tasks, print_papers, print_projects,
@@ -123,8 +124,11 @@ def project(project_name: Optional[str], tasks: bool, papers: bool):
 
     stagnant_exp = get_stagnant_experiments(db, project=project_name)
     long_term_tasks = get_long_term_tasks(db, project=project_name)
+    phase_risks = get_project_phase_risks(db, project_name)
+    stale_unblocked = get_stale_unblocked_tasks(db, project=project_name)
 
-    print_project_review(project, progress, phases_data, stagnant_exp, long_term_tasks)
+    print_project_review(project, progress, phases_data, stagnant_exp, long_term_tasks,
+                         phase_risks=phase_risks, stale_unblocked=stale_unblocked)
 
     show_all = not tasks and not papers
 

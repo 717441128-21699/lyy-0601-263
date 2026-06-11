@@ -274,7 +274,11 @@ def print_tasks(tasks: List[Task], title: str = "任务列表") -> None:
 
 
 def print_task_detail(task: Task, paper: Optional[Paper] = None,
-                      notes: Optional[List[Note]] = None) -> None:
+                      notes: Optional[List[Note]] = None,
+                      phase: Optional["Phase"] = None,
+                      milestone: Optional["Milestone"] = None) -> None:
+    from ..models import Phase, Milestone
+
     content = []
     content.append(f"[bold]标题:[/bold] {task.title}")
 
@@ -296,26 +300,48 @@ def print_task_detail(task: Task, paper: Optional[Paper] = None,
     if task.is_procrastinated and task.status != "done":
         content.append("[yellow bold]⏰ 任务可能被拖延[/]")
 
+    content.append("")
     if paper:
-        content.append("")
         content.append("[bold]关联文献:[/bold]")
         content.append(f"  [{paper.id}] {paper.title}")
+        if paper.authors:
+            content.append(f"  [dim]作者: {paper.authors}[/]")
         if paper.summary:
             summary_text = paper.summary[:100] + "..." if len(paper.summary) > 100 else paper.summary
-            content.append(f"  [dim]{summary_text}[/]")
-    elif paper is not None:
-        content.append("")
+            content.append(f"  [dim]摘要: {summary_text}[/]")
+    else:
         content.append("[bold]关联文献:[/bold] [dim]无[/]")
 
+    content.append("")
     if notes:
-        content.append("")
         content.append(f"[bold]关联笔记 ({len(notes)}):[/bold]")
         for n in notes:
             note_content = n.content[:40] + "..." if len(n.content) > 40 else n.content
             content.append(f"  • [{n.id}] {note_content}")
-    elif notes is not None:
-        content.append("")
+    else:
         content.append("[bold]关联笔记:[/bold] [dim]无[/]")
+
+    content.append("")
+    if phase:
+        phase_status_style = get_phase_status_style(phase.status)
+        phase_status_label = get_phase_status_label(phase.status)
+        content.append("[bold]关联阶段:[/bold]")
+        content.append(f"  [{phase.id}] [{phase_status_style}]{phase_status_label}[/] {phase.name}")
+        if phase.target_date:
+            content.append(f"  [dim]目标日期: {phase.target_date}[/]")
+    else:
+        content.append("[bold]关联阶段:[/bold] [dim]无[/]")
+
+    content.append("")
+    if milestone:
+        ms_status_style = get_milestone_status_style(milestone.status)
+        ms_status_label = get_milestone_status_label(milestone.status)
+        content.append("[bold]关联里程碑:[/bold]")
+        content.append(f"  [{milestone.id}] [{ms_status_style}]{ms_status_label}[/] {milestone.name}")
+        if milestone.target_date:
+            content.append(f"  [dim]目标日期: {milestone.target_date}[/]")
+    else:
+        content.append("[bold]关联里程碑:[/bold] [dim]无[/]")
 
     if task.description:
         content.append("")
@@ -672,6 +698,8 @@ def print_project_review(
     phases_data: List[dict],
     stagnant_exp: List[Task],
     long_term_tasks: List[Task],
+    phase_risks: Optional[List[dict]] = None,
+    stale_unblocked: Optional[List[Task]] = None,
 ) -> None:
     content = []
 
@@ -746,6 +774,45 @@ def print_project_review(
             content.append(f"  • [{t.id}] [yellow]{title_text}[/] [dim](更新: {t.updated_at})[/]")
         if len(stagnant_exp) > 5:
             content.append(f"  [dim]...还有 {len(stagnant_exp) - 5} 项[/]")
+        content.append("")
+
+    if stale_unblocked:
+        content.append(f"[bold yellow]⚠ 长期未更新但未标记阻塞 ({len(stale_unblocked)}):[/bold yellow]")
+        for t in stale_unblocked[:5]:
+            title_text = t.title[:40] + "..." if len(t.title) > 40 else t.title
+            status_style = get_status_style(t.status)
+            status_label = get_status_label(t.status)
+            content.append(f"  • [{t.id}] [{status_style}]{status_label}[/] {title_text} "
+                           f"[dim](更新: {t.updated_at[:10] if t.updated_at else '-'})[/]")
+        if len(stale_unblocked) > 5:
+            content.append(f"  [dim]...还有 {len(stale_unblocked) - 5} 项，建议检查是否需要标记为阻塞[/]")
+        content.append("")
+
+    if phase_risks:
+        content.append("[bold]🔥 阶段依赖与风险:[/bold]")
+        risk_styles = {"high": "red", "medium": "yellow", "low": "green"}
+        risk_labels = {"high": "高", "medium": "中", "low": "低"}
+        for ri, risk in enumerate(phase_risks):
+            ph = risk["phase"]
+            level = risk["risk_level"]
+            style = risk_styles.get(level, "white")
+            label = risk_labels.get(level, level)
+            reasons = risk.get("risk_reasons", [])
+            affected_ms = risk.get("affected_milestones", [])
+            prereqs = risk.get("prerequisite_phases", [])
+
+            prereq_names = " → ".join(p.name for p in prereqs) if prereqs else None
+
+            content.append(f"  [{ph.order}] [{style}]{label}风险[/] [bold]{ph.name}[/]")
+            if prereq_names:
+                content.append(f"      前置依赖: [dim]{prereq_names}[/]")
+            if reasons:
+                for reason in reasons:
+                    content.append(f"      原因: {reason}")
+            if affected_ms:
+                ms_names = ", ".join(m.name for m in affected_ms)
+                ms_color = "red" if level == "high" else "yellow"
+                content.append(f"      影响里程碑: [{ms_color}]{ms_names}[/]")
         content.append("")
 
     if long_term_tasks:
@@ -932,10 +999,11 @@ HEALTH_LEVEL_STYLES = {
 }
 
 
-def print_monthly_overview(projects_health: List[Dict]) -> None:
-    """月度复盘：全项目健康概览"""
+def print_monthly_overview(projects_health: List[Dict],
+                           actions: Optional[Dict[str, List[Dict]]] = None) -> None:
+    """月度复盘：全项目健康概览 + 行动清单"""
     from rich.table import Table
-    from ..storage import normalize_weekly_metrics
+    from ..storage import normalize_weekly_metrics, classify_project_actions
 
     console = Console()
 
@@ -944,53 +1012,65 @@ def print_monthly_overview(projects_health: List[Dict]) -> None:
         print_warning("暂无活跃项目")
         return
 
+    if actions is None:
+        actions = classify_project_actions(projects_health)
+
     excellent_count = sum(1 for h in projects_health if h["level"] == "excellent")
     good_count = sum(1 for h in projects_health if h["level"] == "good")
     warning_count = sum(1 for h in projects_health if h["level"] == "warning")
     critical_count = sum(1 for h in projects_health if h["level"] == "critical")
 
+    push_count = len(actions.get("推进", []))
+    watch_count = len(actions.get("观察", []))
+    pause_count = len(actions.get("暂停", []))
+    archive_count = len(actions.get("归档", []))
+
     header_content = []
     header_content.append(f"[bold]共 {total} 个活跃项目[/bold]")
     header_content.append(f"  [green]优秀: {excellent_count}[/]  [cyan]良好: {good_count}[/]  "
                           f"[yellow]警戒: {warning_count}[/]  [red]危急: {critical_count}[/]")
+    header_content.append("")
+    header_content.append(f"[bold]行动清单:[/bold] "
+                          f"[green]推进 {push_count}[/]  "
+                          f"[yellow]观察 {watch_count}[/]  "
+                          f"[orange3]暂停 {pause_count}[/]  "
+                          f"[red]归档 {archive_count}[/]")
     console.print(Panel("\n".join(header_content), title="📋 月度复盘 - 项目健康概览", expand=False))
     print()
 
-    table = Table(title="项目健康度排名", show_lines=False, show_header=True, header_style="bold")
-    table.add_column("排名", justify="center", width=5)
-    table.add_column("项目", style="bold")
-    table.add_column("得分", justify="center", width=8)
-    table.add_column("等级", justify="center", width=10)
-    table.add_column("任务", justify="center", width=10)
-    table.add_column("任务完成率", justify="center", width=10)
-    table.add_column("阶段", justify="center", width=8)
-    table.add_column("阻塞", justify="center", width=6)
-    table.add_column("停滞实验", justify="center", width=8)
-    table.add_column("建议", style="dim")
+    for action_label, emoji, color in [("推进", "🟢", "green"),
+                                         ("观察", "🟡", "yellow"),
+                                         ("暂停", "🟠", "orange3"),
+                                         ("归档", "🔴", "red")]:
+        action_projects = actions.get(action_label, [])
+        if not action_projects:
+            continue
 
-    for idx, h in enumerate(projects_health, start=1):
-        level = h["level"]
-        style_info = HEALTH_LEVEL_STYLES.get(level, {"label": level, "color": "white"})
-        m = h["metrics"]
+        action_table = Table(title=f"{emoji} 建议{action_label} ({len(action_projects)})",
+                             show_lines=False, show_header=True, header_style="bold")
+        action_table.add_column("项目", style="bold")
+        action_table.add_column("得分", justify="center", width=8)
+        action_table.add_column("任务", justify="center", width=10)
+        action_table.add_column("阻塞", justify="center", width=6)
+        action_table.add_column("停滞实验", justify="center", width=8)
+        action_table.add_column("建议", style="dim")
 
-        tr_style = "green" if m["task_completion_rate"] >= 70 else ("yellow" if m["task_completion_rate"] >= 40 else "red")
-        blocked_style = "red" if m["blocked_count"] > 0 else "white"
-        stagnant_style = "red" if m["stagnant_count"] > 0 else "white"
+        for h in action_projects:
+            m = h["metrics"]
+            tr_style = "green" if m["task_completion_rate"] >= 70 else ("yellow" if m["task_completion_rate"] >= 40 else "red")
+            blocked_style = "red" if m["blocked_count"] > 0 else "white"
+            stagnant_style = "red" if m["stagnant_count"] > 0 else "white"
 
-        table.add_row(
-            str(idx),
-            h["project"].name[:18] + "..." if len(h["project"].name) > 18 else h["project"].name,
-            str(h["score"]),
-            Text(style_info["label"], style=style_info["color"]),
-            f"{m['done_tasks']}/{m['total_tasks']}",
-            Text(f"{m['task_completion_rate']:.1f}%", style=tr_style),
-            f"{m['done_phases']}/{m['total_phases']}",
-            Text(str(m["blocked_count"]), style=blocked_style),
-            Text(str(m["stagnant_count"]), style=stagnant_style),
-            h["suggestion"][:30] + "..." if len(h["suggestion"]) > 30 else h["suggestion"],
-        )
-
-    console.print(table)
+            action_table.add_row(
+                h["project"].name[:18] + "..." if len(h["project"].name) > 18 else h["project"].name,
+                str(h["score"]),
+                f"{m['done_tasks']}/{m['total_tasks']} ({m['task_completion_rate']:.0f}%)",
+                Text(str(m["blocked_count"]), style=blocked_style),
+                Text(str(m["stagnant_count"]), style=stagnant_style),
+                h["suggestion"][:35] + "..." if len(h["suggestion"]) > 35 else h["suggestion"],
+            )
+        console.print(action_table)
+        print()
 
 
 def print_monthly_project_detail(health: Dict) -> None:
