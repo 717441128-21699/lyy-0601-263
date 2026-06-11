@@ -1,13 +1,12 @@
 """数据存储模块"""
 import json
-import os
 from pathlib import Path
-from typing import List, Optional, TypeVar, Callable
+from typing import List, Optional, TypeVar, Callable, Dict, Tuple
 from datetime import datetime, timedelta
 
 from .models import (
     Database, Paper, Note, Task, Project, SubTask,
-    _now_str,
+    Phase, Milestone, _now_str,
 )
 
 T = TypeVar("T")
@@ -54,6 +53,52 @@ def save_db(db: Database) -> None:
         json.dump(db.to_dict(), f, ensure_ascii=False, indent=2)
 
 
+def _safe_migrate_paper(p: dict) -> Paper:
+    """兼容旧版数据，迁移 Paper"""
+    if "note_ids" not in p:
+        p["note_ids"] = p.get("notes", [])
+    if "task_ids" not in p:
+        p["task_ids"] = []
+    p.pop("notes", None)
+    return Paper(**p)
+
+
+def _safe_migrate_note(n: dict) -> Note:
+    """兼容旧版数据，迁移 Note"""
+    if "task_id" not in n:
+        n["task_id"] = None
+    if "task_title" not in n:
+        n["task_title"] = ""
+    return Note(**n)
+
+
+def _safe_migrate_task(t: dict) -> Task:
+    """兼容旧版数据，迁移 Task"""
+    subtasks = [SubTask(**st) for st in t.get("subtasks", [])]
+    t["subtasks"] = subtasks
+    if "note_ids" not in t:
+        t["note_ids"] = []
+    if "phase_id" not in t:
+        t["phase_id"] = None
+    if "milestone_id" not in t:
+        t["milestone_id"] = None
+    return Task(**t)
+
+
+def _safe_migrate_project(p: dict) -> Project:
+    """兼容旧版数据，迁移 Project"""
+    if "milestones" not in p:
+        p["milestones"] = []
+    if "phases" not in p:
+        p["phases"] = []
+
+    milestones = [Milestone(**m) for m in p.get("milestones", [])]
+    phases = [Phase(**ph) for ph in p.get("phases", [])]
+    p["milestones"] = milestones
+    p["phases"] = phases
+    return Project(**p)
+
+
 def load_db() -> Database:
     """从文件加载数据库"""
     db_path = get_db_path()
@@ -63,16 +108,10 @@ def load_db() -> Database:
     with open(db_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    papers = [Paper(**p) for p in data.get("papers", [])]
-    notes = [Note(**n) for n in data.get("notes", [])]
-
-    tasks = []
-    for t in data.get("tasks", []):
-        subtasks = [SubTask(**st) for st in t.get("subtasks", [])]
-        t["subtasks"] = subtasks
-        tasks.append(Task(**t))
-
-    projects = [Project(**p) for p in data.get("projects", [])]
+    papers = [_safe_migrate_paper(p) for p in data.get("papers", [])]
+    notes = [_safe_migrate_note(n) for n in data.get("notes", [])]
+    tasks = [_safe_migrate_task(t) for t in data.get("tasks", [])]
+    projects = [_safe_migrate_project(p) for p in data.get("projects", [])]
 
     return Database(
         papers=papers,
@@ -92,14 +131,24 @@ def _find_by_id(items: List[T], id: str) -> Optional[T]:
     return None
 
 
-def _filter_items(items: List[T], predicate: Callable[[T], bool]) -> List[T]:
-    """过滤项"""
-    return [item for item in items if predicate(item)]
+def ensure_project(db: Database, project_name: str) -> Project:
+    """确保项目存在，不存在则自动创建"""
+    if not project_name:
+        return None
+    project = get_project(db, project_name)
+    if not project:
+        project = Project(name=project_name)
+        add_project(db, project)
+    return project
 
+
+# ==================== Paper 相关 ====================
 
 def add_paper(db: Database, paper: Paper) -> Paper:
     """添加文献"""
     db.papers.append(paper)
+    if paper.project:
+        ensure_project(db, paper.project)
     save_db(db)
     return paper
 
@@ -116,6 +165,8 @@ def update_paper(db: Database, id: str, **kwargs) -> Optional[Paper]:
         for key, value in kwargs.items():
             if hasattr(paper, key) and value is not None:
                 setattr(paper, key, value)
+        if "project" in kwargs and kwargs["project"]:
+            ensure_project(db, kwargs["project"])
         paper.updated_at = _now_str()
         save_db(db)
     return paper
@@ -125,6 +176,13 @@ def delete_paper(db: Database, id: str) -> bool:
     """删除文献"""
     paper = _find_by_id(db.papers, id)
     if paper:
+        for note in db.notes:
+            if note.paper_id == id:
+                note.paper_id = None
+                note.paper_title = ""
+        for task in db.tasks:
+            if task.paper_id == id:
+                task.paper_id = None
         db.papers.remove(paper)
         save_db(db)
         return True
@@ -141,9 +199,33 @@ def list_papers(db: Database, project: Optional[str] = None, status: Optional[st
     return papers
 
 
+def get_paper_notes(db: Database, paper_id: str) -> List[Note]:
+    """获取文献关联的笔记"""
+    return [n for n in db.notes if n.paper_id == paper_id]
+
+
+def get_paper_tasks(db: Database, paper_id: str) -> List[Task]:
+    """获取文献关联的任务"""
+    return [t for t in db.tasks if t.paper_id == paper_id]
+
+
+# ==================== Note 相关 ====================
+
 def add_note(db: Database, note: Note) -> Note:
-    """添加笔记"""
+    """添加笔记，同时维护双向关联"""
     db.notes.append(note)
+    if note.paper_id:
+        paper = get_paper(db, note.paper_id)
+        if paper and note.id not in paper.note_ids:
+            paper.note_ids.append(note.id)
+            paper.updated_at = _now_str()
+    if note.task_id:
+        task = get_task(db, note.task_id)
+        if task and note.id not in task.note_ids:
+            task.note_ids.append(note.id)
+            task.updated_at = _now_str()
+    if note.project:
+        ensure_project(db, note.project)
     save_db(db)
     return note
 
@@ -160,6 +242,8 @@ def update_note(db: Database, id: str, **kwargs) -> Optional[Note]:
         for key, value in kwargs.items():
             if hasattr(note, key) and value is not None:
                 setattr(note, key, value)
+        if "project" in kwargs and kwargs["project"]:
+            ensure_project(db, kwargs["project"])
         note.updated_at = _now_str()
         save_db(db)
     return note
@@ -169,43 +253,50 @@ def delete_note(db: Database, id: str) -> bool:
     """删除笔记"""
     note = _find_by_id(db.notes, id)
     if note:
+        if note.paper_id:
+            paper = get_paper(db, note.paper_id)
+            if paper and id in paper.note_ids:
+                paper.note_ids.remove(id)
+        if note.task_id:
+            task = get_task(db, note.task_id)
+            if task and id in task.note_ids:
+                task.note_ids.remove(id)
         db.notes.remove(note)
         save_db(db)
         return True
     return False
 
 
-def list_notes(db: Database, paper_id: Optional[str] = None, project: Optional[str] = None) -> List[Note]:
+def list_notes(db: Database, paper_id: Optional[str] = None, task_id: Optional[str] = None,
+               project: Optional[str] = None) -> List[Note]:
     """列出笔记"""
     notes = db.notes
     if paper_id:
         notes = [n for n in notes if n.paper_id == paper_id]
+    if task_id:
+        notes = [n for n in notes if n.task_id == task_id]
     if project:
         notes = [n for n in notes if n.project == project]
     return notes
 
 
-def search_notes(db: Database, keyword: str) -> List[Note]:
-    """搜索笔记"""
-    kw = keyword.lower()
-    return [n for n in db.notes if kw in n.content.lower() or any(kw in t.lower() for t in n.tags)]
+def get_task_notes(db: Database, task_id: str) -> List[Note]:
+    """获取任务关联的笔记"""
+    return [n for n in db.notes if n.task_id == task_id]
 
 
-def search_papers(db: Database, keyword: str) -> List[Paper]:
-    """搜索文献"""
-    kw = keyword.lower()
-    return [
-        p for p in db.papers
-        if kw in p.title.lower()
-        or kw in p.authors.lower()
-        or kw in p.summary.lower()
-        or any(kw in t.lower() for t in p.tags)
-    ]
-
+# ==================== Task 相关 ====================
 
 def add_task(db: Database, task: Task) -> Task:
-    """添加任务"""
+    """添加任务，同时维护双向关联"""
     db.tasks.append(task)
+    if task.paper_id:
+        paper = get_paper(db, task.paper_id)
+        if paper and task.id not in paper.task_ids:
+            paper.task_ids.append(task.id)
+            paper.updated_at = _now_str()
+    if task.project:
+        ensure_project(db, task.project)
     save_db(db)
     return task
 
@@ -219,9 +310,21 @@ def update_task(db: Database, id: str, **kwargs) -> Optional[Task]:
     """更新任务"""
     task = _find_by_id(db.tasks, id)
     if task:
+        old_paper_id = task.paper_id
         for key, value in kwargs.items():
             if hasattr(task, key) and value is not None:
                 setattr(task, key, value)
+        if "paper_id" in kwargs and kwargs["paper_id"] != old_paper_id:
+            if old_paper_id:
+                old_paper = get_paper(db, old_paper_id)
+                if old_paper and id in old_paper.task_ids:
+                    old_paper.task_ids.remove(id)
+            if kwargs["paper_id"]:
+                new_paper = get_paper(db, kwargs["paper_id"])
+                if new_paper and id not in new_paper.task_ids:
+                    new_paper.task_ids.append(id)
+        if "project" in kwargs and kwargs["project"]:
+            ensure_project(db, kwargs["project"])
         task.updated_at = _now_str()
         if task.status == "done" and not task.done_at:
             task.done_at = _now_str()
@@ -233,6 +336,14 @@ def delete_task(db: Database, id: str) -> bool:
     """删除任务"""
     task = _find_by_id(db.tasks, id)
     if task:
+        if task.paper_id:
+            paper = get_paper(db, task.paper_id)
+            if paper and id in paper.task_ids:
+                paper.task_ids.remove(id)
+        for note in db.notes:
+            if note.task_id == id:
+                note.task_id = None
+                note.task_title = ""
         db.tasks.remove(task)
         save_db(db)
         return True
@@ -259,44 +370,208 @@ def list_tasks(
     return tasks
 
 
-def get_today_tasks(db: Database) -> List[Task]:
-    """获取今日任务"""
-    today = datetime.now().strftime("%Y-%m-%d")
-    return [
-        t for t in db.tasks
-        if t.status != "done"
-        and (t.due_date == today or not t.due_date)
-    ]
+def get_task_paper(db: Database, task_id: str) -> Optional[Paper]:
+    """获取任务关联的文献"""
+    task = get_task(db, task_id)
+    if task and task.paper_id:
+        return get_paper(db, task.paper_id)
+    return None
 
 
-def get_overdue_tasks(db: Database) -> List[Task]:
+def get_today_tasks(db: Database, project: Optional[str] = None) -> List[Task]:
+    """获取今日到期的任务"""
+    tasks = [t for t in db.tasks if t.is_due_today]
+    if project:
+        tasks = [t for t in tasks if t.project == project]
+    return tasks
+
+
+def get_coming_soon_tasks(db: Database, project: Optional[str] = None) -> List[Task]:
+    """获取即将到期的任务（1-3天内）"""
+    tasks = [t for t in db.tasks if t.is_coming_soon]
+    if project:
+        tasks = [t for t in tasks if t.project == project]
+    return tasks
+
+
+def get_overdue_tasks(db: Database, project: Optional[str] = None) -> List[Task]:
     """获取逾期任务"""
-    return [t for t in db.tasks if t.is_overdue]
+    tasks = [t for t in db.tasks if t.is_overdue]
+    if project:
+        tasks = [t for t in tasks if t.project == project]
+    return tasks
 
 
-def get_procrastinated_tasks(db: Database) -> List[Task]:
+def get_long_pending_tasks(db: Database, project: Optional[str] = None) -> List[Task]:
+    """获取长期未处理的任务（超过14天）"""
+    tasks = [t for t in db.tasks if t.is_long_pending]
+    if project:
+        tasks = [t for t in tasks if t.project == project]
+    return tasks
+
+
+def get_procrastinated_tasks(db: Database, project: Optional[str] = None) -> List[Task]:
     """获取拖延任务"""
-    return [t for t in db.tasks if t.is_procrastinated]
+    tasks = [t for t in db.tasks if t.is_procrastinated]
+    if project:
+        tasks = [t for t in tasks if t.project == project]
+    return tasks
 
 
-def get_this_week_tasks(db: Database) -> List[Task]:
+def get_reminder_tasks(db: Database, project: Optional[str] = None) -> Dict[str, List[Task]]:
+    """获取所有需要提醒的任务，按类型分组"""
+    return {
+        "today": get_today_tasks(db, project),
+        "coming_soon": get_coming_soon_tasks(db, project),
+        "overdue": get_overdue_tasks(db, project),
+        "long_pending": get_long_pending_tasks(db, project),
+    }
+
+
+# ==================== 时间范围查询 ====================
+
+def _parse_date(s: str) -> Optional[datetime]:
+    """尝试解析日期字符串"""
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def get_tasks_in_range(
+    db: Database,
+    start_date: str,
+    end_date: str,
+    project: Optional[str] = None,
+) -> Dict[str, List[Task]]:
+    """按时间范围获取任务
+
+    返回: {
+        'created': 创建时间在范围内的任务,
+        'completed': 完成时间在范围内的任务,
+        'overdue_in_range': 在范围内到期且逾期的任务,
+        'all_active': 范围内所有未完成任务
+    }
+    """
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    if not start or not end:
+        return {"created": [], "completed": [], "overdue_in_range": [], "all_active": []}
+
+    start_date_only = start.date()
+    end_date_only = end.date()
+
+    created, completed, overdue_in_range, all_active = [], [], [], []
+
+    for t in db.tasks:
+        if project and t.project != project:
+            continue
+
+        c = _parse_date(t.created_at)
+        if c and start_date_only <= c.date() <= end_date_only:
+            created.append(t)
+
+        if t.done_at:
+            d = _parse_date(t.done_at)
+            if d and start_date_only <= d.date() <= end_date_only:
+                completed.append(t)
+
+        if t.due_date and not t.is_done:
+            try:
+                due = datetime.strptime(t.due_date, "%Y-%m-%d").date()
+                if start_date_only <= due <= end_date_only and t.is_overdue:
+                    overdue_in_range.append(t)
+            except ValueError:
+                pass
+
+        if not t.is_done:
+            if c and c.date() <= end_date_only:
+                all_active.append(t)
+
+    return {
+        "created": created,
+        "completed": completed,
+        "overdue_in_range": overdue_in_range,
+        "all_active": all_active,
+    }
+
+
+def get_papers_in_range(
+    db: Database,
+    start_date: str,
+    end_date: str,
+    project: Optional[str] = None,
+) -> Dict[str, List[Paper]]:
+    """按时间范围获取文献"""
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    if not start or not end:
+        return {"created": [], "read": []}
+
+    start_date_only = start.date()
+    end_date_only = end.date()
+
+    created, read = [], []
+
+    for p in db.papers:
+        if project and p.project != project:
+            continue
+
+        c = _parse_date(p.created_at)
+        if c and start_date_only <= c.date() <= end_date_only:
+            created.append(p)
+
+        if p.read_at:
+            r = _parse_date(p.read_at)
+            if r and start_date_only <= r.date() <= end_date_only:
+                read.append(p)
+
+    return {"created": created, "read": read}
+
+
+def get_experiment_progress_in_range(
+    db: Database,
+    start_date: str,
+    end_date: str,
+    project: Optional[str] = None,
+) -> Dict:
+    """获取时间范围内的实验进展"""
+    task_data = get_tasks_in_range(db, start_date, end_date, project)
+    exp_tasks = [t for t in task_data["all_active"] + task_data["completed"] if t.experiment_related]
+    exp_done = [t for t in exp_tasks if t.is_done]
+    exp_active = [t for t in exp_tasks if not t.is_done]
+
+    return {
+        "total_experiments": len(exp_tasks),
+        "completed_experiments": len(exp_done),
+        "active_experiments": len(exp_active),
+        "completed_tasks": exp_done,
+        "active_tasks": exp_active,
+    }
+
+
+def get_this_week_tasks(db: Database, project: Optional[str] = None) -> List[Task]:
     """获取本周任务"""
     now = datetime.now()
-    start_of_week = (now - timedelta(days=now.weekday())).date()
-    end_of_week = start_of_week + timedelta(days=6)
+    start_of_week = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+    end_of_week = (now + timedelta(days=6 - now.weekday())).strftime("%Y-%m-%d")
+    data = get_tasks_in_range(db, start_of_week, end_of_week, project)
+    return list(set(data["created"] + data["completed"] + data["all_active"]))
 
-    result = []
-    for t in db.tasks:
-        try:
-            created = datetime.strptime(t.created_at.split()[0], "%Y-%m-%d").date()
-            done = None
-            if t.done_at:
-                done = datetime.strptime(t.done_at.split()[0], "%Y-%m-%d").date()
-            if (start_of_week <= created <= end_of_week) or (done and start_of_week <= done <= end_of_week):
-                result.append(t)
-        except (ValueError, IndexError):
-            continue
-    return result
+
+def get_this_week_completion(db: Database, project: Optional[str] = None) -> dict:
+    """获取本周完成率"""
+    tasks = get_this_week_tasks(db, project)
+    created = [t for t in tasks if t.created_at]
+    completed = [t for t in tasks if t.is_done and t.done_at]
+
+    return {
+        "created": len(created),
+        "completed": len(completed),
+        "total_active": len([t for t in tasks if not t.is_done]),
+    }
 
 
 def add_subtask(db: Database, task_id: str, subtask: SubTask) -> Optional[SubTask]:
@@ -328,6 +603,8 @@ def toggle_subtask(db: Database, task_id: str, subtask_id: str) -> Optional[SubT
     return None
 
 
+# ==================== Project / Phase / Milestone ====================
+
 def add_project(db: Database, project: Project) -> Project:
     """添加项目"""
     db.projects.append(project)
@@ -341,6 +618,17 @@ def get_project(db: Database, name: str) -> Optional[Project]:
         if p.name == name:
             return p
     return None
+
+
+def update_project(db: Database, name: str, **kwargs) -> Optional[Project]:
+    """更新项目"""
+    project = get_project(db, name)
+    if project:
+        for key, value in kwargs.items():
+            if hasattr(project, key) and value is not None:
+                setattr(project, key, value)
+        save_db(db)
+    return project
 
 
 def archive_project(db: Database, name: str) -> Optional[Project]:
@@ -360,6 +648,225 @@ def list_projects(db: Database, include_archived: bool = False) -> List[Project]
     return [p for p in db.projects if not p.archived]
 
 
+def add_phase(db: Database, project_name: str, phase: Phase) -> Optional[Phase]:
+    """为项目添加实验阶段"""
+    project = get_project(db, project_name)
+    if not project:
+        project = ensure_project(db, project_name)
+    if phase.order == 0:
+        phase.order = len(project.phases) + 1
+    project.phases.append(phase)
+    project.updated_at = _now_str() if hasattr(project, 'updated_at') else _now_str()
+    save_db(db)
+    return phase
+
+
+def get_phase(db: Database, project_name: str, phase_id: str) -> Optional[Phase]:
+    """获取项目阶段"""
+    project = get_project(db, project_name)
+    if not project:
+        return None
+    return _find_by_id(project.phases, phase_id)
+
+
+def update_phase(db: Database, project_name: str, phase_id: str, **kwargs) -> Optional[Phase]:
+    """更新项目阶段"""
+    phase = get_phase(db, project_name, phase_id)
+    if phase:
+        for key, value in kwargs.items():
+            if hasattr(phase, key) and value is not None:
+                setattr(phase, key, value)
+        if phase.status == "done" and not phase.done_at:
+            phase.done_at = _now_str()
+        phase.updated_at = _now_str()
+        save_db(db)
+    return phase
+
+
+def delete_phase(db: Database, project_name: str, phase_id: str) -> bool:
+    """删除项目阶段"""
+    project = get_project(db, project_name)
+    if not project:
+        return False
+    phase = _find_by_id(project.phases, phase_id)
+    if phase:
+        for t in db.tasks:
+            if t.phase_id == phase_id:
+                t.phase_id = None
+        project.phases.remove(phase)
+        save_db(db)
+        return True
+    return False
+
+
+def get_phase_tasks(db: Database, project_name: str, phase_id: str) -> List[Task]:
+    """获取阶段关联的任务"""
+    return [t for t in db.tasks if t.phase_id == phase_id]
+
+
+def get_current_phase(db: Database, project_name: str) -> Optional[Phase]:
+    """获取项目当前进行中的阶段"""
+    project = get_project(db, project_name)
+    if not project or not project.phases:
+        return None
+    active = [p for p in project.phases if p.status == "active"]
+    if active:
+        return sorted(active, key=lambda x: x.order)[0]
+    pending = [p for p in project.phases if p.status == "pending"]
+    if pending:
+        return sorted(pending, key=lambda x: x.order)[0]
+    return sorted(project.phases, key=lambda x: x.order)[-1]
+
+
+def get_blocked_tasks_in_phase(db: Database, project_name: str, phase_id: str) -> List[Task]:
+    """获取阶段中被阻塞的任务"""
+    tasks = get_phase_tasks(db, project_name, phase_id)
+    return [t for t in tasks if t.status == "blocked"]
+
+
+def add_milestone(db: Database, project_name: str, milestone: Milestone) -> Optional[Milestone]:
+    """为项目添加里程碑"""
+    project = get_project(db, project_name)
+    if not project:
+        project = ensure_project(db, project_name)
+    project.milestones.append(milestone)
+    save_db(db)
+    return milestone
+
+
+def get_milestone(db: Database, project_name: str, milestone_id: str) -> Optional[Milestone]:
+    """获取里程碑"""
+    project = get_project(db, project_name)
+    if not project:
+        return None
+    return _find_by_id(project.milestones, milestone_id)
+
+
+def update_milestone(db: Database, project_name: str, milestone_id: str, **kwargs) -> Optional[Milestone]:
+    """更新里程碑"""
+    milestone = get_milestone(db, project_name, milestone_id)
+    if milestone:
+        for key, value in kwargs.items():
+            if hasattr(milestone, key) and value is not None:
+                setattr(milestone, key, value)
+        if milestone.status == "done" and not milestone.achieved_date:
+            milestone.achieved_date = _now_str()
+        milestone.updated_at = _now_str()
+        save_db(db)
+    return milestone
+
+
+def delete_milestone(db: Database, project_name: str, milestone_id: str) -> bool:
+    """删除里程碑"""
+    project = get_project(db, project_name)
+    if not project:
+        return False
+    milestone = _find_by_id(project.milestones, milestone_id)
+    if milestone:
+        for t in db.tasks:
+            if t.milestone_id == milestone_id:
+                t.milestone_id = None
+        project.milestones.remove(milestone)
+        save_db(db)
+        return True
+    return False
+
+
+def get_milestone_tasks(db: Database, project_name: str, milestone_id: str) -> List[Task]:
+    """获取里程碑关联的任务"""
+    return [t for t in db.tasks if t.milestone_id == milestone_id]
+
+
+def get_project_progress(db: Database, project_name: str) -> Dict:
+    """获取项目整体进度"""
+    tasks = list_tasks(db, project=project_name)
+    papers = list_papers(db, project=project_name)
+    project = get_project(db, project_name)
+
+    total_tasks = len(tasks)
+    done_tasks = len([t for t in tasks if t.is_done])
+    exp_tasks = [t for t in tasks if t.experiment_related]
+    blocked_tasks = [t for t in tasks if t.status == "blocked"]
+
+    total_papers = len(papers)
+    read_papers = len([p for p in papers if p.status == "read"])
+
+    phases = project.phases if project else []
+    done_phases = [p for p in phases if p.status == "done"]
+    active_phase = get_current_phase(db, project_name)
+
+    milestones = project.milestones if project else []
+    done_milestones = [m for m in milestones if m.status == "done"]
+
+    return {
+        "task_completion": (done_tasks / total_tasks * 100) if total_tasks > 0 else 0,
+        "total_tasks": total_tasks,
+        "done_tasks": done_tasks,
+        "active_tasks": len([t for t in tasks if t.status == "doing"]),
+        "blocked_tasks": blocked_tasks,
+        "paper_progress": (read_papers / total_papers * 100) if total_papers > 0 else 0,
+        "total_papers": total_papers,
+        "read_papers": read_papers,
+        "total_phases": len(phases),
+        "done_phases": len(done_phases),
+        "active_phase": active_phase,
+        "total_milestones": len(milestones),
+        "done_milestones": len(done_milestones),
+        "experiment_count": len(exp_tasks),
+        "experiment_done": len([t for t in exp_tasks if t.is_done]),
+    }
+
+
+# ==================== 搜索 ====================
+
+def search_notes(db: Database, keyword: str) -> List[Note]:
+    """搜索笔记"""
+    kw = keyword.lower()
+    return [n for n in db.notes if kw in n.content.lower() or any(kw in t.lower() for t in n.tags)]
+
+
+def search_papers(db: Database, keyword: str) -> List[Paper]:
+    """搜索文献"""
+    kw = keyword.lower()
+    return [
+        p for p in db.papers
+        if kw in p.title.lower()
+        or kw in p.authors.lower()
+        or kw in p.summary.lower()
+        or any(kw in t.lower() for t in p.tags)
+    ]
+
+
+def search_tasks(db: Database, keyword: str) -> List[Task]:
+    """搜索任务"""
+    kw = keyword.lower()
+    return [
+        t for t in db.tasks
+        if kw in t.title.lower()
+        or kw in t.description.lower()
+        or any(kw in tag.lower() for tag in t.tags)
+    ]
+
+
+def search_all(db: Database, keyword: str, project: Optional[str] = None) -> Dict[str, list]:
+    """综合搜索：同时搜索文献、笔记、任务
+
+    返回: {'papers': [...], 'notes': [...], 'tasks': [...]}
+    """
+    papers = search_papers(db, keyword)
+    notes = search_notes(db, keyword)
+    tasks = search_tasks(db, keyword)
+
+    if project:
+        papers = [p for p in papers if p.project == project]
+        notes = [n for n in notes if n.project == project]
+        tasks = [t for t in tasks if t.project == project]
+
+    return {"papers": papers, "notes": notes, "tasks": tasks}
+
+
+# ==================== 统计 ====================
+
 def get_completion_rate(db: Database, project: Optional[str] = None) -> dict:
     """获取完成率统计"""
     tasks = list_tasks(db, project=project) if project else db.tasks
@@ -370,6 +877,9 @@ def get_completion_rate(db: Database, project: Optional[str] = None) -> dict:
     blocked = len([t for t in tasks if t.status == "blocked"])
     overdue = len([t for t in tasks if t.is_overdue])
     procrastinated = len([t for t in tasks if t.is_procrastinated])
+    long_pending = len([t for t in tasks if t.is_long_pending])
+    today = len([t for t in tasks if t.is_due_today])
+    coming_soon = len([t for t in tasks if t.is_coming_soon])
 
     return {
         "total": total,
@@ -379,32 +889,8 @@ def get_completion_rate(db: Database, project: Optional[str] = None) -> dict:
         "blocked": blocked,
         "overdue": overdue,
         "procrastinated": procrastinated,
+        "long_pending": long_pending,
+        "today": today,
+        "coming_soon": coming_soon,
         "rate": (done / total * 100) if total > 0 else 0,
-    }
-
-
-def get_this_week_completion(db: Database, project: Optional[str] = None) -> dict:
-    """获取本周完成率"""
-    tasks = get_this_week_tasks(db)
-    if project:
-        tasks = [t for t in tasks if t.project == project]
-
-    now = datetime.now()
-    start_of_week = (now - timedelta(days=now.weekday())).date()
-
-    completed_this_week = [
-        t for t in tasks
-        if t.status == "done" and t.done_at
-        and datetime.strptime(t.done_at.split()[0], "%Y-%m-%d").date() >= start_of_week
-    ]
-
-    created_this_week = [
-        t for t in tasks
-        if datetime.strptime(t.created_at.split()[0], "%Y-%m-%d").date() >= start_of_week
-    ]
-
-    return {
-        "created": len(created_this_week),
-        "completed": len(completed_this_week),
-        "total_active": len([t for t in tasks if t.status != "done"]),
     }

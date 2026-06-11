@@ -6,6 +6,7 @@ from ..models import Paper, Project, _now_str
 from ..storage import (
     load_db, add_paper, get_paper, update_paper, delete_paper,
     list_papers, search_papers, get_project, add_project,
+    get_paper_notes, get_paper_tasks, ensure_project,
 )
 from ..utils.formatting import (
     print_papers, print_paper_detail, print_success, print_error,
@@ -44,7 +45,7 @@ def add(title: str, authors: str, year: Optional[int], venue: str,
         return
 
     if project and not get_project(db, project):
-        add_project(db, Project(name=project))
+        ensure_project(db, project)
         print_success(f"已自动创建新项目: {project}")
 
     tags = list(tag)
@@ -110,7 +111,9 @@ def show(id: str):
         print_error(f"未找到 ID 为 {id} 的文献")
         return
 
-    print_paper_detail(paper)
+    notes = get_paper_notes(db, id)
+    tasks = get_paper_tasks(db, id)
+    print_paper_detail(paper, notes=notes, tasks=tasks)
 
 
 @paper.command()
@@ -145,7 +148,7 @@ def update(id: str, status: Optional[str], summary: Optional[str],
     if project is not None:
         kwargs["project"] = project
         if project and not get_project(db, project):
-            add_project(db, __import__('..models', fromlist=['Project']).Project(name=project))
+            ensure_project(db, project)
             print_success(f"已自动创建新项目: {project}")
     if tag:
         new_tags = list(set(paper.tags + list(tag)))

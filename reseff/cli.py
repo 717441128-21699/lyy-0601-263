@@ -1,8 +1,11 @@
 """ResEff CLI - 科研助理个人效率工具"""
 import click
+from typing import Optional
 from rich.console import Console
 
 from . import __version__
+from .storage import load_db, search_all
+from .utils.formatting import print_search_results, print_error, print_warning
 from .commands.init_cmd import init
 from .commands.paper_cmd import paper
 from .commands.note_cmd import note
@@ -26,9 +29,10 @@ ResEff - 科研助理个人效率命令行工具
   paper   文献管理
   note    笔记管理
   task    任务管理
-  plan    计划与安排
+  plan    计划与安排（含阶段/里程碑）
   review  回顾与统计
   export  导出与归档
+  search  综合搜索（文献/笔记/任务）
 
 使用 'reseff <command> --help' 查看各命令的详细帮助。
 """,
@@ -42,6 +46,31 @@ ResEff - 科研助理个人效率命令行工具
 def cli():
     """ResEff CLI 主入口"""
     pass
+
+
+@cli.command("search")
+@click.argument("keyword")
+@click.option("--project", "-p", default=None, help="按项目筛选")
+def search_cmd(keyword: str, project: Optional[str]):
+    """综合搜索：在文献、笔记、任务中搜索关键词
+
+    KEYWORD: 搜索关键词
+    """
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    results = search_all(db, keyword, project=project)
+    total = len(results["papers"]) + len(results["notes"]) + len(results["tasks"])
+
+    if total == 0:
+        hint = f" in project '{project}'" if project else ""
+        print_warning(f"未找到包含 '{keyword}' 的内容{hint}")
+        return
+
+    print_search_results(results)
 
 
 cli.add_command(init)

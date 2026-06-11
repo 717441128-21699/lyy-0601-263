@@ -3,14 +3,44 @@ import click
 from typing import Optional
 from datetime import datetime, timedelta
 
+from ..models import Phase, Milestone
 from ..storage import (
     load_db, get_today_tasks, list_tasks, list_papers,
     get_project, list_projects,
+    add_phase, get_phase, update_phase, delete_phase,
+    add_milestone, get_milestone, update_milestone, delete_milestone,
+    get_phase_tasks, get_blocked_tasks_in_phase, get_project_progress,
+    get_current_phase, ensure_project,
 )
 from ..utils.formatting import (
     print_tasks, print_papers, print_projects,
     print_success, print_error, print_warning, print_info,
+    print_phases, print_milestones, print_project_detail,
 )
+
+
+def parse_date(date_str: str) -> Optional[str]:
+    """解析日期字符串，返回 YYYY-MM-DD 格式"""
+    if not date_str:
+        return None
+
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m-%d",
+        "%m/%d",
+    ]
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            if fmt in ["%m-%d", "%m/%d"]:
+                dt = dt.replace(year=datetime.now().year)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    return None
 
 
 @click.group()
@@ -92,6 +122,9 @@ def project(project_name: Optional[str], tasks: bool, papers: bool):
     if not project:
         print_error(f"未找到项目: {project_name}")
         return
+
+    progress = get_project_progress(db, project_name)
+    print_project_detail(project, progress)
 
     show_all = not tasks and not papers
 
@@ -179,3 +212,412 @@ def projects(all: bool):
         return
 
     print_projects(projects)
+
+
+# ==================== phase 子命令组 ====================
+
+@plan.group()
+def phase():
+    """项目阶段管理"""
+    pass
+
+
+@phase.command(name="add")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--name", "-n", required=True, help="阶段名称")
+@click.option("--description", "-d", default="", help="阶段描述")
+@click.option("--order", type=int, default=0, help="阶段顺序（默认0，自动追加）")
+@click.option("--target", default=None, help="目标日期 (YYYY-MM-DD)")
+def phase_add(project: str, name: str, description: str, order: int, target: Optional[str]):
+    """添加项目阶段"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    ensure_project(db, project)
+
+    target_date = parse_date(target)
+    if target and not target_date:
+        print_error(f"日期格式无效: {target}，请使用 YYYY-MM-DD 格式")
+        return
+
+    phase = Phase(
+        name=name,
+        description=description,
+        order=order,
+        target_date=target_date,
+    )
+
+    result = add_phase(db, project, phase)
+    if result:
+        print_success(f"阶段添加成功: [{result.id}] {result.name}")
+
+
+@phase.command(name="list")
+@click.option("--project", "-p", required=True, help="项目名称")
+def phase_list(project: str):
+    """列出项目所有阶段"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    proj = get_project(db, project)
+    if not proj:
+        print_error(f"未找到项目: {project}")
+        return
+
+    if not proj.phases:
+        print_warning(f"项目 '{project}' 暂无阶段")
+        return
+
+    print_phases(proj.phases, project)
+
+
+@phase.command(name="show")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "phase_id", required=True, help="阶段ID")
+def phase_show(project: str, phase_id: str):
+    """查看阶段详情和关联任务"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    phase = get_phase(db, project, phase_id)
+    if not phase:
+        print_error(f"未找到阶段 ID: {phase_id}")
+        return
+
+    content = []
+    content.append(f"[bold]阶段名称:[/bold] {phase.name}")
+    content.append(f"[bold]描述:[/bold] {phase.description or '-'}")
+    content.append(f"[bold]顺序:[/bold] {phase.order}")
+    from ..utils.formatting import get_phase_status_label, get_phase_status_style
+    status_style = get_phase_status_style(phase.status)
+    status_label = get_phase_status_label(phase.status)
+    content.append(f"[bold]状态:[/bold] [{status_style}]{status_label}[/]")
+    content.append(f"[bold]目标日期:[/bold] {phase.target_date or '-'}")
+    content.append(f"[bold]完成日期:[/bold] {phase.done_at or '-'}")
+    content.append("")
+    content.append(f"[dim]创建: {phase.created_at} | 更新: {phase.updated_at}[/]")
+
+    from rich.panel import Panel
+    from rich.console import Console
+    console = Console()
+    console.print(Panel("\n".join(content), title=f"阶段详情 [{phase.id}]", expand=False))
+
+    phase_tasks = get_phase_tasks(db, project, phase_id)
+    if phase_tasks:
+        print_tasks(phase_tasks, title=f"阶段关联任务 ({len(phase_tasks)})")
+    else:
+        print_warning("该阶段暂无关联任务")
+
+
+@phase.command(name="update")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "phase_id", required=True, help="阶段ID")
+@click.option("--name", "-n", default=None, help="更新阶段名称")
+@click.option("--description", "-d", default=None, help="更新阶段描述")
+@click.option("--order", type=int, default=None, help="更新阶段顺序")
+@click.option("--target", default=None, help="更新目标日期 (YYYY-MM-DD)")
+def phase_update(project: str, phase_id: str, name: Optional[str],
+                 description: Optional[str], order: Optional[int],
+                 target: Optional[str]):
+    """更新阶段信息"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    phase = get_phase(db, project, phase_id)
+    if not phase:
+        print_error(f"未找到阶段 ID: {phase_id}")
+        return
+
+    kwargs = {}
+    if name is not None:
+        kwargs["name"] = name
+    if description is not None:
+        kwargs["description"] = description
+    if order is not None:
+        kwargs["order"] = order
+    if target is not None:
+        target_date = parse_date(target)
+        if not target_date:
+            print_error(f"日期格式无效: {target}，请使用 YYYY-MM-DD 格式")
+            return
+        kwargs["target_date"] = target_date
+
+    if not kwargs:
+        print_warning("未指定任何更新内容")
+        return
+
+    updated = update_phase(db, project, phase_id, **kwargs)
+    if updated:
+        print_success(f"阶段更新成功: [{phase_id}]")
+
+
+@phase.command(name="status")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "phase_id", required=True, help="阶段ID")
+@click.option("--status", required=True,
+              type=click.Choice(["pending", "active", "done", "blocked"]),
+              help="阶段状态")
+def phase_status(project: str, phase_id: str, status: str):
+    """设置阶段状态"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    phase = get_phase(db, project, phase_id)
+    if not phase:
+        print_error(f"未找到阶段 ID: {phase_id}")
+        return
+
+    updated = update_phase(db, project, phase_id, status=status)
+    if updated:
+        from ..utils.formatting import get_phase_status_label
+        print_success(f"阶段状态已更新为: {get_phase_status_label(status)}")
+
+
+@phase.command(name="blocked")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "phase_id", required=True, help="阶段ID")
+def phase_blocked(project: str, phase_id: str):
+    """查看阶段中阻塞的任务"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    phase = get_phase(db, project, phase_id)
+    if not phase:
+        print_error(f"未找到阶段 ID: {phase_id}")
+        return
+
+    blocked_tasks = get_blocked_tasks_in_phase(db, project, phase_id)
+    if not blocked_tasks:
+        print_success("该阶段没有阻塞的任务 🎉")
+        return
+
+    print_tasks(blocked_tasks, title=f"阶段阻塞任务 ({len(blocked_tasks)})")
+
+
+@phase.command(name="delete")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "phase_id", required=True, help="阶段ID")
+@click.option("--yes", is_flag=True, help="确认删除，无需提示")
+def phase_delete(project: str, phase_id: str, yes: bool):
+    """删除阶段"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    phase = get_phase(db, project, phase_id)
+    if not phase:
+        print_error(f"未找到阶段 ID: {phase_id}")
+        return
+
+    if not yes:
+        click.confirm(f"确定要删除阶段 '{phase.name}' 吗?", abort=True)
+
+    deleted = delete_phase(db, project, phase_id)
+    if deleted:
+        print_success(f"阶段已删除: [{phase_id}]")
+
+
+# ==================== milestone 子命令组 ====================
+
+@plan.group()
+def milestone():
+    """项目里程碑管理"""
+    pass
+
+
+@milestone.command(name="add")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--name", "-n", required=True, help="里程碑名称")
+@click.option("--description", "-d", default="", help="里程碑描述")
+@click.option("--target", default=None, help="目标日期 (YYYY-MM-DD)")
+def milestone_add(project: str, name: str, description: str, target: Optional[str]):
+    """添加项目里程碑"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    ensure_project(db, project)
+
+    target_date = parse_date(target)
+    if target and not target_date:
+        print_error(f"日期格式无效: {target}，请使用 YYYY-MM-DD 格式")
+        return
+
+    milestone = Milestone(
+        name=name,
+        description=description,
+        target_date=target_date,
+    )
+
+    result = add_milestone(db, project, milestone)
+    if result:
+        print_success(f"里程碑添加成功: [{result.id}] {result.name}")
+
+
+@milestone.command(name="list")
+@click.option("--project", "-p", required=True, help="项目名称")
+def milestone_list(project: str):
+    """列出项目所有里程碑"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    proj = get_project(db, project)
+    if not proj:
+        print_error(f"未找到项目: {project}")
+        return
+
+    if not proj.milestones:
+        print_warning(f"项目 '{project}' 暂无里程碑")
+        return
+
+    print_milestones(proj.milestones, project)
+
+
+@milestone.command(name="show")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "milestone_id", required=True, help="里程碑ID")
+def milestone_show(project: str, milestone_id: str):
+    """查看里程碑详情"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    milestone = get_milestone(db, project, milestone_id)
+    if not milestone:
+        print_error(f"未找到里程碑 ID: {milestone_id}")
+        return
+
+    content = []
+    content.append(f"[bold]里程碑名称:[/bold] {milestone.name}")
+    content.append(f"[bold]描述:[/bold] {milestone.description or '-'}")
+    from ..utils.formatting import get_milestone_status_label, get_milestone_status_style
+    status_style = get_milestone_status_style(milestone.status)
+    status_label = get_milestone_status_label(milestone.status)
+    content.append(f"[bold]状态:[/bold] [{status_style}]{status_label}[/]")
+    content.append(f"[bold]目标日期:[/bold] {milestone.target_date or '-'}")
+    content.append(f"[bold]达成日期:[/bold] {milestone.achieved_date or '-'}")
+    content.append("")
+    content.append(f"[dim]创建: {milestone.created_at} | 更新: {milestone.updated_at}[/]")
+
+    from rich.panel import Panel
+    from rich.console import Console
+    console = Console()
+    console.print(Panel("\n".join(content), title=f"里程碑详情 [{milestone.id}]", expand=False))
+
+
+@milestone.command(name="update")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "milestone_id", required=True, help="里程碑ID")
+@click.option("--name", "-n", default=None, help="更新里程碑名称")
+@click.option("--description", "-d", default=None, help="更新里程碑描述")
+@click.option("--target", default=None, help="更新目标日期 (YYYY-MM-DD)")
+def milestone_update(project: str, milestone_id: str, name: Optional[str],
+                     description: Optional[str], target: Optional[str]):
+    """更新里程碑信息"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    milestone = get_milestone(db, project, milestone_id)
+    if not milestone:
+        print_error(f"未找到里程碑 ID: {milestone_id}")
+        return
+
+    kwargs = {}
+    if name is not None:
+        kwargs["name"] = name
+    if description is not None:
+        kwargs["description"] = description
+    if target is not None:
+        target_date = parse_date(target)
+        if not target_date:
+            print_error(f"日期格式无效: {target}，请使用 YYYY-MM-DD 格式")
+            return
+        kwargs["target_date"] = target_date
+
+    if not kwargs:
+        print_warning("未指定任何更新内容")
+        return
+
+    updated = update_milestone(db, project, milestone_id, **kwargs)
+    if updated:
+        print_success(f"里程碑更新成功: [{milestone_id}]")
+
+
+@milestone.command(name="status")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "milestone_id", required=True, help="里程碑ID")
+@click.option("--status", required=True,
+              type=click.Choice(["pending", "active", "done", "delayed"]),
+              help="里程碑状态")
+def milestone_status(project: str, milestone_id: str, status: str):
+    """设置里程碑状态"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    milestone = get_milestone(db, project, milestone_id)
+    if not milestone:
+        print_error(f"未找到里程碑 ID: {milestone_id}")
+        return
+
+    updated = update_milestone(db, project, milestone_id, status=status)
+    if updated:
+        from ..utils.formatting import get_milestone_status_label
+        print_success(f"里程碑状态已更新为: {get_milestone_status_label(status)}")
+
+
+@milestone.command(name="delete")
+@click.option("--project", "-p", required=True, help="项目名称")
+@click.option("--id", "milestone_id", required=True, help="里程碑ID")
+@click.option("--yes", is_flag=True, help="确认删除，无需提示")
+def milestone_delete(project: str, milestone_id: str, yes: bool):
+    """删除里程碑"""
+    try:
+        db = load_db()
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return
+
+    milestone = get_milestone(db, project, milestone_id)
+    if not milestone:
+        print_error(f"未找到里程碑 ID: {milestone_id}")
+        return
+
+    if not yes:
+        click.confirm(f"确定要删除里程碑 '{milestone.name}' 吗?", abort=True)
+
+    deleted = delete_milestone(db, project, milestone_id)
+    if deleted:
+        print_success(f"里程碑已删除: [{milestone_id}]")

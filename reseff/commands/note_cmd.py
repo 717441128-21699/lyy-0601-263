@@ -5,7 +5,8 @@ from typing import Optional
 from ..models import Note
 from ..storage import (
     load_db, add_note, get_note, update_note, delete_note,
-    list_notes, search_notes, get_paper,
+    list_notes, search_notes, get_paper, get_task,
+    ensure_project, get_project,
 )
 from ..utils.formatting import (
     print_notes, print_note_detail, print_success, print_error,
@@ -25,9 +26,10 @@ def note():
 @note.command()
 @click.option("--content", "-c", required=True, help="笔记内容")
 @click.option("--paper", "-p", default=None, help="关联的文献ID")
+@click.option("--task", "-k", default=None, help="关联的任务ID")
 @click.option("--project", "-j", default="", help="所属项目")
 @click.option("--tag", multiple=True, help="标签（可多次指定）")
-def add(content: str, paper: Optional[str], project: str, tag):
+def add(content: str, paper: Optional[str], task: Optional[str], project: str, tag):
     """添加新笔记"""
     try:
         db = load_db()
@@ -43,11 +45,27 @@ def add(content: str, paper: Optional[str], project: str, tag):
             return
         paper_title = p.title
 
+    task_title = ""
+    if task:
+        t = get_task(db, task)
+        if not t:
+            print_error(f"未找到 ID 为 {task} 的任务")
+            return
+        task_title = t.title
+
+    if project:
+        existed = get_project(db, project) is not None
+        ensure_project(db, project)
+        if not existed:
+            print_success(f"已自动创建新项目: {project}")
+
     tags = list(tag)
     note = Note(
         content=content,
         paper_id=paper,
         paper_title=paper_title,
+        task_id=task,
+        task_title=task_title,
         project=project,
         tags=tags,
     )
@@ -58,8 +76,9 @@ def add(content: str, paper: Optional[str], project: str, tag):
 
 @note.command(name="list")
 @click.option("--paper", "-p", default=None, help="按文献ID筛选")
+@click.option("--task", "-k", default=None, help="按任务ID筛选")
 @click.option("--project", "-j", default=None, help="按项目筛选")
-def list_cmd(paper: Optional[str], project: Optional[str]):
+def list_cmd(paper: Optional[str], task: Optional[str], project: Optional[str]):
     """列出所有笔记"""
     try:
         db = load_db()
@@ -67,7 +86,7 @@ def list_cmd(paper: Optional[str], project: Optional[str]):
         print_error(str(e))
         return
 
-    notes = list_notes(db, paper_id=paper, project=project)
+    notes = list_notes(db, paper_id=paper, task_id=task, project=project)
 
     if not notes:
         print_warning("暂无笔记记录")
@@ -80,6 +99,12 @@ def list_cmd(paper: Optional[str], project: Optional[str]):
             title += f" - 文献: {p.title[:30]}..."
         else:
             title += f" - 文献ID: {paper}"
+    if task:
+        t = get_task(db, task)
+        if t:
+            title += f" - 任务: {t.title[:30]}..."
+        else:
+            title += f" - 任务ID: {task}"
     if project:
         title += f" - 项目: {project}"
 
@@ -127,6 +152,11 @@ def update(id: str, content: Optional[str], project: Optional[str], tag):
         kwargs["content"] = content
     if project is not None:
         kwargs["project"] = project
+        if project:
+            existed = get_project(db, project) is not None
+            ensure_project(db, project)
+            if not existed:
+                print_success(f"已自动创建新项目: {project}")
     if tag:
         new_tags = list(set(note.tags + list(tag)))
         kwargs["tags"] = new_tags

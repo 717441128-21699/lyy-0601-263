@@ -8,6 +8,7 @@ from ..storage import (
     load_db, add_task, get_task, update_task, delete_task,
     list_tasks, get_procrastinated_tasks, get_overdue_tasks,
     add_subtask, toggle_subtask, get_paper, get_project, add_project,
+    get_task_paper, get_task_notes, ensure_project,
 )
 from ..utils.formatting import (
     print_tasks, print_task_detail, print_success, print_error,
@@ -59,9 +60,12 @@ def task():
 @click.option("--experiment/--no-experiment", default=False,
               help="是否为实验相关任务")
 @click.option("--paper", default=None, help="关联的文献ID")
+@click.option("--phase", default=None, help="关联的阶段ID")
+@click.option("--milestone", default=None, help="关联的里程碑ID")
 @click.option("--tag", multiple=True, help="标签（可多次指定）")
 def add(title: str, description: str, project: str, priority: str,
-        due: Optional[str], experiment: bool, paper: Optional[str], tag):
+        due: Optional[str], experiment: bool, paper: Optional[str],
+        phase: Optional[str], milestone: Optional[str], tag):
     """添加新任务"""
     try:
         db = load_db()
@@ -74,9 +78,11 @@ def add(title: str, description: str, project: str, priority: str,
         print_error(f"日期格式无效: {due}，请使用 YYYY-MM-DD 格式")
         return
 
-    if project and not get_project(db, project):
-        add_project(db, Project(name=project))
-        print_success(f"已自动创建新项目: {project}")
+    if project:
+        existed = get_project(db, project) is not None
+        ensure_project(db, project)
+        if not existed:
+            print_success(f"已自动创建新项目: {project}")
 
     if paper and not get_paper(db, paper):
         print_error(f"未找到 ID 为 {paper} 的文献")
@@ -91,6 +97,8 @@ def add(title: str, description: str, project: str, priority: str,
         due_date=due_date,
         experiment_related=experiment,
         paper_id=paper,
+        phase_id=phase,
+        milestone_id=milestone,
         tags=tags,
     )
 
@@ -107,8 +115,11 @@ def add(title: str, description: str, project: str, priority: str,
               type=click.Choice(["low", "medium", "high"]),
               help="按优先级筛选")
 @click.option("--experiment", "-e", is_flag=True, help="仅显示实验相关任务")
+@click.option("--phase", default=None, help="按阶段ID筛选")
+@click.option("--milestone", default=None, help="按里程碑ID筛选")
 def list_cmd(project: Optional[str], status: Optional[str],
-             priority: Optional[str], experiment: bool):
+             priority: Optional[str], experiment: bool,
+             phase: Optional[str], milestone: Optional[str]):
     """列出所有任务"""
     try:
         db = load_db()
@@ -124,6 +135,11 @@ def list_cmd(project: Optional[str], status: Optional[str],
         experiment_only=experiment,
     )
 
+    if phase:
+        tasks = [t for t in tasks if t.phase_id == phase]
+    if milestone:
+        tasks = [t for t in tasks if t.milestone_id == milestone]
+
     if not tasks:
         print_warning("暂无任务记录")
         return
@@ -138,6 +154,10 @@ def list_cmd(project: Optional[str], status: Optional[str],
         filters.append(f"优先级: {priority}")
     if experiment:
         filters.append("仅实验相关")
+    if phase:
+        filters.append(f"阶段: {phase}")
+    if milestone:
+        filters.append(f"里程碑: {milestone}")
     if filters:
         title += " - " + " | ".join(filters)
 
@@ -159,7 +179,9 @@ def show(id: str):
         print_error(f"未找到 ID 为 {id} 的任务")
         return
 
-    print_task_detail(task)
+    paper = get_task_paper(db, id)
+    notes = get_task_notes(db, id)
+    print_task_detail(task, paper=paper, notes=notes)
 
 
 @task.command()
@@ -174,10 +196,13 @@ def show(id: str):
               type=click.Choice(["todo", "doing", "done", "blocked"]),
               help="更新状态")
 @click.option("--due", "-e", default=None, help="更新截止日期")
+@click.option("--phase", default=None, help="更新关联的阶段ID")
+@click.option("--milestone", default=None, help="更新关联的里程碑ID")
 @click.option("--tag", multiple=True, help="添加标签（可多次指定）")
 def update(id: str, title: Optional[str], description: Optional[str],
            project: Optional[str], priority: Optional[str],
-           status: Optional[str], due: Optional[str], tag):
+           status: Optional[str], due: Optional[str],
+           phase: Optional[str], milestone: Optional[str], tag):
     """更新任务信息"""
     try:
         db = load_db()
@@ -197,9 +222,11 @@ def update(id: str, title: Optional[str], description: Optional[str],
         kwargs["description"] = description
     if project is not None:
         kwargs["project"] = project
-        if project and not get_project(db, project):
-            add_project(db, __import__('..models', fromlist=['Project']).Project(name=project))
-            print_success(f"已自动创建新项目: {project}")
+        if project:
+            existed = get_project(db, project) is not None
+            ensure_project(db, project)
+            if not existed:
+                print_success(f"已自动创建新项目: {project}")
     if priority is not None:
         kwargs["priority"] = priority
     if status is not None:
@@ -210,6 +237,10 @@ def update(id: str, title: Optional[str], description: Optional[str],
             print_error(f"日期格式无效: {due}，请使用 YYYY-MM-DD 格式")
             return
         kwargs["due_date"] = due_date
+    if phase is not None:
+        kwargs["phase_id"] = phase
+    if milestone is not None:
+        kwargs["milestone_id"] = milestone
     if tag:
         new_tags = list(set(task.tags + list(tag)))
         kwargs["tags"] = new_tags

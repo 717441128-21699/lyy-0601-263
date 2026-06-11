@@ -1,7 +1,7 @@
 """数据模型定义"""
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 
 
@@ -11,6 +11,43 @@ def _now_str() -> str:
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:8]
+
+
+@dataclass
+class Phase:
+    """实验阶段模型"""
+    id: str = field(default_factory=_new_id)
+    name: str = ""
+    description: str = ""
+    order: int = 0
+    status: str = "pending"  # pending, active, done, blocked
+    target_date: Optional[str] = None
+    done_at: Optional[str] = None
+    task_ids: List[str] = field(default_factory=list)
+    note_ids: List[str] = field(default_factory=list)
+    created_at: str = field(default_factory=_now_str)
+    updated_at: str = field(default_factory=_now_str)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Milestone:
+    """里程碑模型"""
+    id: str = field(default_factory=_new_id)
+    name: str = ""
+    description: str = ""
+    target_date: Optional[str] = None
+    achieved_date: Optional[str] = None
+    status: str = "pending"  # pending, active, done, delayed
+    task_ids: List[str] = field(default_factory=list)
+    phase_ids: List[str] = field(default_factory=list)
+    created_at: str = field(default_factory=_now_str)
+    updated_at: str = field(default_factory=_now_str)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass
@@ -27,7 +64,8 @@ class Paper:
     tags: List[str] = field(default_factory=list)
     project: str = ""
     experiment_steps: List[str] = field(default_factory=list)
-    notes: List[str] = field(default_factory=list)
+    note_ids: List[str] = field(default_factory=list)
+    task_ids: List[str] = field(default_factory=list)
     created_at: str = field(default_factory=_now_str)
     updated_at: str = field(default_factory=_now_str)
     read_at: Optional[str] = None
@@ -43,6 +81,8 @@ class Note:
     content: str = ""
     paper_id: Optional[str] = None
     paper_title: str = ""
+    task_id: Optional[str] = None
+    task_title: str = ""
     tags: List[str] = field(default_factory=list)
     project: str = ""
     created_at: str = field(default_factory=_now_str)
@@ -79,6 +119,9 @@ class Task:
     subtasks: List[SubTask] = field(default_factory=list)
     experiment_related: bool = False
     paper_id: Optional[str] = None
+    note_ids: List[str] = field(default_factory=list)
+    phase_id: Optional[str] = None
+    milestone_id: Optional[str] = None
     created_at: str = field(default_factory=_now_str)
     updated_at: str = field(default_factory=_now_str)
     done_at: Optional[str] = None
@@ -87,8 +130,12 @@ class Task:
         return asdict(self)
 
     @property
+    def is_done(self) -> bool:
+        return self.status == "done"
+
+    @property
     def is_overdue(self) -> bool:
-        if not self.due_date or self.status == "done":
+        if not self.due_date or self.is_done:
             return False
         try:
             due = datetime.strptime(self.due_date, "%Y-%m-%d")
@@ -97,8 +144,46 @@ class Task:
             return False
 
     @property
+    def is_due_today(self) -> bool:
+        if not self.due_date or self.is_done:
+            return False
+        try:
+            due = datetime.strptime(self.due_date, "%Y-%m-%d")
+            return due.date() == datetime.now().date()
+        except ValueError:
+            return False
+
+    @property
+    def is_coming_soon(self) -> bool:
+        if not self.due_date or self.is_done:
+            return False
+        if self.is_overdue or self.is_due_today:
+            return False
+        try:
+            due = datetime.strptime(self.due_date, "%Y-%m-%d")
+            days_left = (due.date() - datetime.now().date()).days
+            return 1 <= days_left <= 3
+        except ValueError:
+            return False
+
+    @property
+    def is_long_pending(self) -> bool:
+        """超过14天仍未完成的任务"""
+        if self.is_done:
+            return False
+        if self.is_overdue:
+            return False
+        try:
+            created = datetime.strptime(self.created_at.split()[0], "%Y-%m-%d")
+            days_passed = (datetime.now().date() - created.date()).days
+            return days_passed > 14
+        except (ValueError, IndexError):
+            return False
+
+    @property
     def is_procrastinated(self) -> bool:
-        if self.status == "done":
+        """被拖延的任务：逾期或超过7天未动"""
+        if self.is_done:
             return False
         if self.is_overdue:
             return True
@@ -117,11 +202,22 @@ class Project:
     name: str = ""
     description: str = ""
     archived: bool = False
+    milestones: List[Milestone] = field(default_factory=list)
+    phases: List[Phase] = field(default_factory=list)
     created_at: str = field(default_factory=_now_str)
     archived_at: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "archived": self.archived,
+            "milestones": [m.to_dict() for m in self.milestones],
+            "phases": [p.to_dict() for p in self.phases],
+            "created_at": self.created_at,
+            "archived_at": self.archived_at,
+        }
 
 
 @dataclass
